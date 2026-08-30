@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+#
+# eitb -- launcher for the eitb CLI. Builds the Lua C module on first
+# use (or after a clean), then forwards every argument to the Lua
+# entry point.
+
+set -eu
+set -o pipefail
+
+cd "$(dirname "$0")/.."
+
+if [[ ! -f lua/itb.so ]]; then
+    ./build.sh >&2
+fi
+
+LUA="${LUA:-lua5.4}"
+if ! command -v "$LUA" >/dev/null 2>&1; then
+    LUA=lua
+fi
+
+export LUA_PATH="$PWD/lua/?.lua;;"
+export LUA_CPATH="$PWD/lua/?.so;;"
+
+exec "$LUA" eitb/itb_eitb.lua "$@"
