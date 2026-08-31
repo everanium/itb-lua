@@ -145,11 +145,24 @@ local opts = itb.opts({ nonce_bits = 512, key_bits = 1024, chunk_size = 65536 })
 local pipe = itb.create("streaming-aead-triple-mac-v1", opts)
 ```
 
-Go runtime knobs: `itb.set_memory_limit(bytes)` and
-`itb.set_gc_percent(pct)` (negative values query without changing).
 `itb.hashes()` returns the shipped hash primitive roster in canonical
 registry order; `itb.profiles()` returns the built-in Triple profile
 names.
+
+## Memory
+
+Two process-wide knobs constrain Go runtime arena pacing, readable at
+libitb load time via env vars (`ITB_GOMEMLIMIT`, `ITB_GOGC`) and
+adjustable at any time programmatically. Pass a negative value to
+query without changing. Long-running or allocation-heavy workloads
+(benchmarks, bulk encryption) should set both — without a soft cap +
+aggressive GC the Go scratch heap grows unboundedly under allocation
+churn:
+
+```lua
+itb.set_memory_limit(512 * 1024 * 1024) -- 512 MiB soft cap
+itb.set_gc_percent(20)                  -- aggressive GC
+```
 
 ## Testing
 
@@ -180,7 +193,7 @@ via `itb.set_memory_limit(512 * 1024 * 1024)` and
 `itb.set_gc_percent(20)`. See `bindings/BENCH.md` for the fleet-wide
 configuration authority and comparison tables.
 
-## eitb CLI
+## eitb utility
 
 ```bash
 ./bindings/lua/eitb/eitb version
