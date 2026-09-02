@@ -54,7 +54,7 @@ end
 run("version", function()
     local v = itb.version()
     assert(type(v) == "string" and #v > 0, "empty version")
-    assert(itb._VERSION == "0.3.3")
+    assert(itb._VERSION == "0.3.4")
 end)
 
 run("hashes canonical order", function()
