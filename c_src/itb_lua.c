@@ -57,7 +57,7 @@
 
 #include "libitb.h"
 
-#define ITB_LUA_VERSION "0.3.1"
+#define ITB_LUA_VERSION "0.3.2"
 
 #define PIPE_MT "itb.pipeline"
 #define STREAM_MT "itb.stream"
