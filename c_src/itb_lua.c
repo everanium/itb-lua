@@ -11,10 +11,12 @@
  * Surface registered on the module table:
  *
  *   itb.create(profile [, opts])            -> Pipeline
- *   itb.open(profile, blob [, opts [, perm, wrap]]) -> Pipeline
- *   itb.register_profile(name, opts)
- *   itb.hashes()                            -> { {name=..., width=...}, ... }
- *   itb.profiles()                          -> { "streaming-aead-triple-mac-v1", ... }
+ *   itb.load(blob [, perm, wrap])           -> Pipeline
+ *   itb.load_f(path [, perm, wrap])         -> Pipeline
+ *   itb.inspect(blob)                       -> profile-record JSON string
+ *   itb.register(name, profile_json)
+ *   itb.lookup(name)                        -> profile-record JSON string
+ *   itb.profiles()                          -> { "blob-triple-mac-v1", ... } (sorted)
  *   itb.version()                           -> string
  *   itb.set_memory_limit(bytes)             -> previous limit
  *   itb.set_gc_percent(pct)                 -> previous percent
@@ -25,7 +27,8 @@
  *   :encrypt_message(plain) / :decrypt_message(wire)
  *   :encrypt_stream_one_shot(plain) / :decrypt_stream_one_shot(wire)
  *   :encrypt_stream() / :decrypt_stream()   -> Stream session
- *   :blob() :rekey(perm, wrap) :close() :free()
+ *   :save() -> blob  :save_f(path)  :rekey(perm, wrap) -> blob
+ *   :max_workers(n) :close() :free()
  *
  * Stream userdata methods (metatable "itb.stream"):
  *   :write(src) :finish() :read([max]) -> chunk, finished
@@ -57,7 +60,7 @@
 
 #include "libitb.h"
 
-#define ITB_LUA_VERSION "0.3.5"
+#define ITB_LUA_VERSION "0.4.1"
 
 #define PIPE_MT "itb.pipeline"
 #define STREAM_MT "itb.stream"
@@ -81,6 +84,9 @@ enum {
     ST_SEED_WIDTH_MIX = 8,
     ST_BAD_MAC = 9,
     ST_MAC_FAILURE = 10,
+    ST_BLOB_MALFORMED_RECIPE = 11,
+    ST_RECIPE_PRIMITIVE_UNKNOWN = 12,
+    ST_UNKNOWN_PROFILE = 13,
     ST_BLOB_MODE_MISMATCH = 19,
     ST_BLOB_MALFORMED = 20,
     ST_BLOB_VERSION_TOO_NEW = 21,
@@ -110,6 +116,10 @@ static const status_row STATUS_ROWS[] = {
     {ST_SEED_WIDTH_MIX, "SEED_WIDTH_MIX", "seed width mismatch"},
     {ST_BAD_MAC, "BAD_MAC", "unknown MAC name or invalid MAC handle"},
     {ST_MAC_FAILURE, "MAC_FAILURE", "MAC verification failed"},
+    {ST_BLOB_MALFORMED_RECIPE, "BLOB_MALFORMED_RECIPE", "blob profile record invalid"},
+    {ST_RECIPE_PRIMITIVE_UNKNOWN, "RECIPE_PRIMITIVE_UNKNOWN",
+     "blob profile record names a primitive absent from the local registries"},
+    {ST_UNKNOWN_PROFILE, "UNKNOWN_PROFILE", "unknown profile name"},
     {ST_BLOB_MODE_MISMATCH, "BLOB_MODE_MISMATCH", "blob mode mismatch"},
     {ST_BLOB_MALFORMED, "BLOB_MALFORMED", "malformed state blob"},
     {ST_BLOB_VERSION_TOO_NEW, "BLOB_VERSION_TOO_NEW", "blob version too new"},
@@ -130,20 +140,6 @@ static const char *status_label(int code) {
     }
     return "unknown status";
 }
-
-/* Shipped built-in Triple profile names (mirrors the profile registry
- * in triple/profile.go; the C ABI exposes no profile enumeration). */
-static const char *const PROFILE_NAMES[] = {
-    "streaming-aead-triple-mac-v1",
-    "streaming-noaead-triple-v1",
-    "singlemsg-triple-mac-v1",
-    "singlemsg-triple-nomac-v1",
-    "blob-triple-mac-v1",
-    "streaming-aead-triple-mac-mixed-v1",
-    "streaming-noaead-triple-mixed-v1",
-    "singlemsg-triple-mac-mixed-v1",
-    "singlemsg-triple-nomac-mixed-v1",
-};
 
 /* ---- error raising ------------------------------------------------ */
 
@@ -268,40 +264,31 @@ static int cipher_call(lua_State *L, cipher_fn fn, uintptr_t handle,
     return raise_status(L, ST_BUFFER_TOO_SMALL);
 }
 
-/* ---- module functions ---------------------------------------------- */
+/* ---- caller-allocated-buffer helper --------------------------------- */
 
-/* Floor capacity for blob output buffers (Init / Rekey). */
+/* Floor capacity for blob output buffers (Init / Save / Rekey). */
 #define BLOB_CAP ((size_t)(64 * 1024))
 
-/* Pushes a fresh Pipeline userdata wrapping `handle` with the string
- * at `blob_idx` stored as its blob uservalue. */
-static void push_pipe(lua_State *L, uintptr_t handle, int blob_idx) {
-    lpipe *p;
-    blob_idx = lua_absindex(L, blob_idx);
-    p = (lpipe *)lua_newuserdatauv(L, sizeof(*p), 1);
-    p->handle = handle;
-    luaL_setmetatable(L, PIPE_MT);
-    lua_pushvalue(L, blob_idx);
-    lua_setiuservalue(L, -2, 1);
-}
+/* Floor capacity for profile-JSON output buffers (Inspect / Lookup /
+ * Profiles). */
+#define JSON_CAP ((size_t)(4 * 1024))
 
-/* itb.create(profile [, opts]) -> Pipeline */
-static int l_create(lua_State *L) {
-    const char *profile = luaL_checkstring(L, 1);
-    const char *opts = luaL_optstring(L, 2, "");
-    size_t cap = BLOB_CAP;
+/* One caller-allocated-buffer call: writes into (out, cap) and reports
+ * the produced or required length through n. */
+typedef int (*buf_fn)(void *ctx, void *out, size_t cap, size_t *n);
+
+/* Runs a caller-allocated-buffer entry with the retry-once discipline
+ * and leaves the produced bytes on the stack as a string. */
+static int buf_call(lua_State *L, buf_fn fn, void *ctx, size_t cap) {
     int attempt;
     for (attempt = 0; attempt < 2; attempt++) {
         luaL_Buffer b;
         char *p = luaL_buffinitsize(L, &b, cap);
         size_t n = 0;
-        uintptr_t handle = 0;
-        int rc = ITB_Triple_Init(MUT(profile), MUT(opts), p, cap, &n, &handle);
+        int rc = fn(ctx, p, cap, &n);
         if (rc == ST_BUFFER_TOO_SMALL && n > cap && attempt == 0) {
-            /* libitb closes the undersized attempt before returning;
-             * the retry re-runs Init and yields a fresh session. */
             luaL_pushresultsize(&b, 0);
-            lua_pop(L, 1);
+            lua_pop(L, 1); /* discard the undersized buffer */
             cap = n;
             continue;
         }
@@ -310,50 +297,147 @@ static int l_create(lua_State *L) {
             lua_pop(L, 1);
             return raise_status(L, rc);
         }
-        luaL_pushresultsize(&b, n); /* blob string on stack */
-        push_pipe(L, handle, -1);
+        luaL_pushresultsize(&b, n);
         return 1;
     }
     return raise_status(L, ST_BUFFER_TOO_SMALL);
 }
 
-/* itb.open(profile, blob [, opts [, perm, wrap]]) -> Pipeline */
-static int l_open(lua_State *L) {
-    const char *profile = luaL_checkstring(L, 1);
-    size_t bloblen = 0;
-    const char *blob = luaL_checklstring(L, 2, &bloblen);
-    const char *opts = luaL_optstring(L, 3, "");
-    size_t permlen = 0, wraplen = 0, count = 0;
-    const char *perm = "", *wrap = "";
-    uintptr_t handle = 0;
-    int rc;
-    if (!lua_isnoneornil(L, 4) || !lua_isnoneornil(L, 5)) {
-        perm = luaL_checklstring(L, 4, &permlen);
-        wrap = luaL_checklstring(L, 5, &wraplen);
-        if (permlen == 0 || wraplen == 0) {
-            return luaL_error(L, "itb: master override buffers must be non-empty");
-        }
-        count = 2;
-    }
-    rc = ITB_Triple_Open(MUT(profile), MUT(blob), bloblen, MUT(opts),
-                         MUT(perm), permlen, MUT(wrap), wraplen, count,
-                         &handle);
-    if (rc != ST_OK) {
-        return raise_status(L, rc);
-    }
-    push_pipe(L, handle, 2);
+/* ---- module functions ---------------------------------------------- */
+
+/* Pushes a fresh Pipeline userdata wrapping `handle`. */
+static void push_pipe(lua_State *L, uintptr_t handle) {
+    lpipe *p = (lpipe *)lua_newuserdatauv(L, sizeof(*p), 0);
+    p->handle = handle;
+    luaL_setmetatable(L, PIPE_MT);
+}
+
+typedef struct {
+    const char *profile;
+    const char *opts;
+    uintptr_t handle;
+} init_ctx;
+
+static int init_thunk(void *ctx, void *out, size_t cap, size_t *n) {
+    init_ctx *c = (init_ctx *)ctx;
+    /* libitb closes an undersized attempt before returning; the retry
+     * re-runs Init and yields a fresh session. */
+    return ITB_Triple_Init(MUT(c->profile), MUT(c->opts), out, cap, n,
+                           &c->handle);
+}
+
+/* itb.create(profile [, opts]) -> Pipeline. The session blob is
+ * available through pipe:save(). */
+static int l_create(lua_State *L) {
+    init_ctx c;
+    c.profile = luaL_checkstring(L, 1);
+    c.opts = luaL_optstring(L, 2, "");
+    c.handle = 0;
+    buf_call(L, init_thunk, &c, BLOB_CAP);
+    lua_pop(L, 1); /* the Init-time blob copy; save() re-reads it */
+    push_pipe(L, c.handle);
     return 1;
 }
 
-/* itb.register_profile(name, opts) */
-static int l_register_profile(lua_State *L) {
+/* Reads the optional (perm, wrap) master pair at stack slots
+ * `first` / `first + 1` into the masters triple the Load entries
+ * take: count 0 selects the blob-embedded masters, count 2 overrides
+ * them. */
+static void masters_triple(lua_State *L, int first, const char **perm,
+                           size_t *permlen, const char **wrap,
+                           size_t *wraplen, size_t *count) {
+    *perm = "";
+    *wrap = "";
+    *permlen = 0;
+    *wraplen = 0;
+    *count = 0;
+    if (!lua_isnoneornil(L, first) || !lua_isnoneornil(L, first + 1)) {
+        *perm = luaL_checklstring(L, first, permlen);
+        *wrap = luaL_checklstring(L, first + 1, wraplen);
+        *count = 2;
+    }
+}
+
+/* itb.load(blob [, perm, wrap]) -> Pipeline. The blob's embedded
+ * profile record is the sole structural source. */
+static int l_load(lua_State *L) {
+    size_t bloblen = 0;
+    const char *blob = luaL_checklstring(L, 1, &bloblen);
+    const char *perm, *wrap;
+    size_t permlen, wraplen, count;
+    uintptr_t handle = 0;
+    int rc;
+    masters_triple(L, 2, &perm, &permlen, &wrap, &wraplen, &count);
+    rc = ITB_Triple_Load(MUT(blob), bloblen, MUT(perm), permlen, MUT(wrap),
+                         wraplen, count, &handle);
+    if (rc != ST_OK) {
+        return raise_status(L, rc);
+    }
+    push_pipe(L, handle);
+    return 1;
+}
+
+/* itb.load_f(path [, perm, wrap]) -> Pipeline. The file is read
+ * inside the library. */
+static int l_load_f(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    const char *perm, *wrap;
+    size_t permlen, wraplen, count;
+    uintptr_t handle = 0;
+    int rc;
+    masters_triple(L, 2, &perm, &permlen, &wrap, &wraplen, &count);
+    rc = ITB_Triple_LoadF(MUT(path), MUT(perm), permlen, MUT(wrap), wraplen,
+                          count, &handle);
+    if (rc != ST_OK) {
+        return raise_status(L, rc);
+    }
+    push_pipe(L, handle);
+    return 1;
+}
+
+typedef struct {
+    const char *blob;
+    size_t bloblen;
+} inspect_ctx;
+
+static int inspect_thunk(void *ctx, void *out, size_t cap, size_t *n) {
+    inspect_ctx *c = (inspect_ctx *)ctx;
+    return ITB_Triple_Inspect(MUT(c->blob), c->bloblen, out, cap, n);
+}
+
+/* itb.inspect(blob) -> profile-record JSON string (the encoding
+ * itb.register accepts and the blob carries; name included). */
+static int l_inspect(lua_State *L) {
+    inspect_ctx c;
+    c.blob = luaL_checklstring(L, 1, &c.bloblen);
+    return buf_call(L, inspect_thunk, &c, JSON_CAP);
+}
+
+/* itb.register(name, profile_json) */
+static int l_register(lua_State *L) {
     const char *name = luaL_checkstring(L, 1);
-    const char *opts = luaL_checkstring(L, 2);
-    int rc = ITB_Triple_RegisterProfile(MUT(name), MUT(opts));
+    const char *json = luaL_checkstring(L, 2);
+    int rc = ITB_Triple_Register(MUT(name), MUT(json));
     if (rc != ST_OK) {
         return raise_status(L, rc);
     }
     return 0;
+}
+
+static int lookup_thunk(void *ctx, void *out, size_t cap, size_t *n) {
+    return ITB_Triple_Lookup(MUT((const char *)ctx), out, cap, n);
+}
+
+/* itb.lookup(name) -> profile-record JSON string; an unknown name
+ * raises UNKNOWN_PROFILE. */
+static int l_lookup(lua_State *L) {
+    const char *name = luaL_checkstring(L, 1);
+    return buf_call(L, lookup_thunk, (void *)(uintptr_t)name, JSON_CAP);
+}
+
+static int profiles_thunk(void *ctx, void *out, size_t cap, size_t *n) {
+    (void)ctx;
+    return ITB_Triple_Profiles(out, cap, n);
 }
 
 /* itb.version() -> string */
@@ -381,37 +465,33 @@ static int l_version(lua_State *L) {
     return 1;
 }
 
-/* itb.hashes() -> array of {name=..., width=...} in registry order */
-static int l_hashes(lua_State *L) {
-    int count = ITB_HashCount();
-    int i;
-    lua_createtable(L, count, 0);
-    for (i = 0; i < count; i++) {
-        char name[128];
-        size_t n = 0;
-        int rc = ITB_HashName(i, name, sizeof(name), &n);
-        if (rc != ST_OK) {
-            return raise_status(L, rc);
-        }
-        lua_createtable(L, 0, 2);
-        lua_pushlstring(L, name, n > 0 ? n - 1 : 0);
-        lua_setfield(L, -2, "name");
-        lua_pushinteger(L, ITB_HashWidth(i));
-        lua_setfield(L, -2, "width");
-        lua_rawseti(L, -2, i + 1);
-    }
-    return 1;
-}
-
-/* itb.profiles() -> array of shipped built-in profile names */
+/* itb.profiles() -> sorted array of every registered profile name.
+ * libitb writes a JSON array of strings; profile names are restricted
+ * to [a-z0-9-] so the array unpacks by scanning the quoted items. */
 static int l_profiles(lua_State *L) {
-    size_t count = sizeof(PROFILE_NAMES) / sizeof(PROFILE_NAMES[0]);
-    size_t i;
-    lua_createtable(L, (int)count, 0);
-    for (i = 0; i < count; i++) {
-        lua_pushstring(L, PROFILE_NAMES[i]);
-        lua_rawseti(L, -2, (lua_Integer)(i + 1));
+    size_t len = 0;
+    const char *json;
+    const char *p;
+    lua_Integer i = 0;
+    buf_call(L, profiles_thunk, NULL, JSON_CAP);
+    json = lua_tolstring(L, -1, &len);
+    lua_createtable(L, 0, 0);
+    p = json;
+    while (p < json + len) {
+        const char *q = memchr(p, '"', (size_t)(json + len - p));
+        const char *e;
+        if (q == NULL) {
+            break;
+        }
+        e = memchr(q + 1, '"', (size_t)(json + len - (q + 1)));
+        if (e == NULL) {
+            break;
+        }
+        lua_pushlstring(L, q + 1, (size_t)(e - (q + 1)));
+        lua_rawseti(L, -2, ++i);
+        p = e + 1;
     }
+    lua_remove(L, -2); /* drop the JSON text, keep the array */
     return 1;
 }
 
@@ -469,51 +549,65 @@ static int l_pipe_decrypt_stream_one_shot(lua_State *L) {
     return cipher_call(L, ITB_Triple_DecryptStream, p->handle, src, n);
 }
 
-static int l_pipe_blob(lua_State *L) {
-    check_pipe(L, 1);
-    lua_getiuservalue(L, 1, 1);
-    return 1;
+static int save_thunk(void *ctx, void *out, size_t cap, size_t *n) {
+    return ITB_Triple_Save(*(uintptr_t *)ctx, out, cap, n);
 }
 
-/* pipe:rekey(perm, wrap) — rotates the parallax + wrapper masters and
- * refreshes the blob uservalue. */
+/* pipe:save() -> blob string: the bytes create produced, the bytes
+ * load re-marshalled, or the bytes of the latest rekey. */
+static int l_pipe_save(lua_State *L) {
+    lpipe *p = check_pipe(L, 1);
+    uintptr_t h = p->handle;
+    return buf_call(L, save_thunk, &h, BLOB_CAP);
+}
+
+/* pipe:save_f(path) — writes the blob to path inside the library
+ * (mode 0600). */
+static int l_pipe_save_f(lua_State *L) {
+    lpipe *p = check_pipe(L, 1);
+    const char *path = luaL_checkstring(L, 2);
+    int rc = ITB_Triple_SaveF(p->handle, MUT(path));
+    if (rc != ST_OK) {
+        return raise_status(L, rc);
+    }
+    return 0;
+}
+
+typedef struct {
+    uintptr_t handle;
+    const char *perm;
+    size_t permlen;
+    const char *wrap;
+    size_t wraplen;
+} rekey_ctx;
+
+static int rekey_thunk(void *ctx, void *out, size_t cap, size_t *n) {
+    rekey_ctx *c = (rekey_ctx *)ctx;
+    return ITB_Triple_Rekey(c->handle, MUT(c->perm), c->permlen, MUT(c->wrap),
+                            c->wraplen, out, cap, n);
+}
+
+/* pipe:rekey(perm, wrap) -> blob string: rotates the parallax +
+ * wrapper masters and returns the refreshed blob. */
 static int l_pipe_rekey(lua_State *L) {
     lpipe *p = check_pipe(L, 1);
-    size_t permlen = 0, wraplen = 0;
-    const char *perm = luaL_checklstring(L, 2, &permlen);
-    const char *wrap = luaL_checklstring(L, 3, &wraplen);
-    size_t cap = BLOB_CAP;
-    int attempt;
-    /* Never shrink below the current blob size. */
-    lua_getiuservalue(L, 1, 1);
-    {
-        size_t cur = 0;
-        lua_tolstring(L, -1, &cur);
-        if (cur > cap) cap = cur;
+    rekey_ctx c;
+    c.handle = p->handle;
+    c.perm = luaL_checklstring(L, 2, &c.permlen);
+    c.wrap = luaL_checklstring(L, 3, &c.wraplen);
+    return buf_call(L, rekey_thunk, &c, BLOB_CAP);
+}
+
+/* pipe:max_workers(n) — sets the worker cap; n is clamped by libitb
+ * (n <= 0 auto, > 256 treated as 256), never rejected. */
+static int l_pipe_max_workers(lua_State *L) {
+    lpipe *p = check_pipe(L, 1);
+    lua_Integer n = luaL_checkinteger(L, 2);
+    int rc = ITB_Triple_MaxWorkers(p->handle, (int)n);
+    if (rc != ST_OK) {
+        return raise_status(L, rc);
     }
-    lua_pop(L, 1);
-    for (attempt = 0; attempt < 2; attempt++) {
-        luaL_Buffer b;
-        char *buf = luaL_buffinitsize(L, &b, cap);
-        size_t n = 0;
-        int rc = ITB_Triple_Rekey(p->handle, MUT(perm), permlen, MUT(wrap),
-                                  wraplen, buf, cap, &n);
-        if (rc == ST_BUFFER_TOO_SMALL && n > cap && attempt == 0) {
-            luaL_pushresultsize(&b, 0);
-            lua_pop(L, 1);
-            cap = n;
-            continue;
-        }
-        if (rc != ST_OK) {
-            luaL_pushresultsize(&b, 0);
-            lua_pop(L, 1);
-            return raise_status(L, rc);
-        }
-        luaL_pushresultsize(&b, n);
-        lua_setiuservalue(L, 1, 1); /* refresh the stored blob */
-        return 0;
-    }
-    return raise_status(L, ST_BUFFER_TOO_SMALL);
+    return 0;
 }
 
 /* pipe:close() — zeroes the key material and marks the Pipeline
@@ -673,8 +767,10 @@ static const luaL_Reg PIPE_METHODS[] = {
     {"decrypt_stream_one_shot", l_pipe_decrypt_stream_one_shot},
     {"encrypt_stream", l_pipe_encrypt_stream},
     {"decrypt_stream", l_pipe_decrypt_stream},
-    {"blob", l_pipe_blob},
+    {"save", l_pipe_save},
+    {"save_f", l_pipe_save_f},
     {"rekey", l_pipe_rekey},
+    {"max_workers", l_pipe_max_workers},
     {"close", l_pipe_close},
     {"free", l_pipe_free},
     {NULL, NULL},
@@ -691,11 +787,13 @@ static const luaL_Reg STREAM_METHODS[] = {
 
 static const luaL_Reg MODULE_FUNCS[] = {
     {"create", l_create},
-    {"open", l_open},
-    {"register_profile", l_register_profile},
-    {"version", l_version},
-    {"hashes", l_hashes},
+    {"load", l_load},
+    {"load_f", l_load_f},
+    {"inspect", l_inspect},
+    {"register", l_register},
+    {"lookup", l_lookup},
     {"profiles", l_profiles},
+    {"version", l_version},
     {"set_memory_limit", l_set_memory_limit},
     {"set_gc_percent", l_set_gc_percent},
     {"now", l_now},

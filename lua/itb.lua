@@ -26,16 +26,16 @@ local M = loader()
 -- Opts builder.
 --
 -- Renders a Lua table into the URL-query opts string consumed by
--- itb.create / itb.open / itb.register_profile. No validation is
--- performed here — every key and value passes through to Go verbatim
--- (percent-encoded); libitb rejects unknown keys or bad values with a
--- diagnostic surfaced through the error object.
+-- itb.create. No validation is performed here — every key and value
+-- passes through to Go verbatim (percent-encoded); libitb rejects
+-- unknown keys or bad values with a diagnostic surfaced through the
+-- error object. (Profile registration takes a JSON record — see
+-- itb.register — not an opts string.)
 --
 -- Snake_case keys map onto the Go opts grammar; any key not in the
--- map is passed through unchanged (the raw escape hatch covering the
--- register-profile grammar: mode, width, innerHashes, parallaxOn,
--- wrapperOn, ...). Values: booleans render as "true"/"false",
--- integers as decimals, tables as comma-joined lists, strings as-is.
+-- map is passed through unchanged. Values: booleans render as
+-- "true"/"false", integers as decimals, tables as comma-joined lists,
+-- strings as-is.
 
 local KEY_MAP = {
     nonce_bits = "nonceBits",

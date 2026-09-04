@@ -3,20 +3,24 @@
 -- Subcommands:
 --
 --     itb_eitb.lua version                                library + binding versions
---     itb_eitb.lua hashes                                 shipped hash primitive roster
---     itb_eitb.lua profiles                               built-in Triple profile names
+--     itb_eitb.lua profiles                               registered profile catalogue
+--     itb_eitb.lua inspect <blob-hex>                     profile record of a blob
 --     itb_eitb.lua encrypt <profile> <in-file> <out-file> Single Message encrypt
 --     itb_eitb.lua decrypt <profile> <blob-hex> <in-file> <out-file>
 --
--- `encrypt` prints the session blob to stderr as hex; feed that hex
--- back to `decrypt` on the receiving side.
+-- `encrypt` prints the session blob (`pipe:save()`) to stderr as hex;
+-- feed that hex back to `decrypt` on the receiving side, which
+-- reopens the session with `itb.load` (the profile argument only
+-- routes Single Message versus streaming). `profiles` lists the
+-- registered profile catalogue one name per line; the profiles that
+-- carry a cipher surface are the ones `encrypt` / `decrypt` accept.
 
 local itb = require "itb"
 
 local USAGE = [[
 usage: eitb version
-       eitb hashes
        eitb profiles
+       eitb inspect <blob-hex>
        eitb encrypt <profile> <in-file> <out-file>
        eitb decrypt <profile> <blob-hex> <in-file> <out-file>]]
 
@@ -40,16 +44,20 @@ local function cmd_version()
     print("itb-lua " .. itb._VERSION)
 end
 
-local function cmd_hashes()
-    for i, h in ipairs(itb.hashes()) do
-        print(("%2d  %-12s %d bits"):format(i - 1, h.name, h.width))
-    end
-end
-
 local function cmd_profiles()
     for _, name in ipairs(itb.profiles()) do
         print(name)
     end
+end
+
+local function blob_from_hex(blob_hex)
+    local ok, blob = pcall(itb.fromhex, blob_hex)
+    if not ok then error("blob hex: " .. tostring(blob), 0) end
+    return blob
+end
+
+local function cmd_inspect(blob_hex)
+    print(itb.inspect(blob_from_hex(blob_hex)))
 end
 
 -- Profiles whose canonical name begins with "streaming-" route
@@ -77,16 +85,15 @@ local function cmd_encrypt(profile, infile, outfile)
         or pipe:encrypt_message(plain)
     ensure_parent_dir(outfile)
     write_file(outfile, wire)
-    io.stderr:write(itb.tohex(pipe:blob()) .. "\n")
+    io.stderr:write(itb.tohex(pipe:save()) .. "\n")
     print(("encrypted %s -> %s (%d -> %d bytes)")
         :format(infile, outfile, #plain, #wire))
 end
 
 local function cmd_decrypt(profile, blob_hex, infile, outfile)
-    local ok, blob = pcall(itb.fromhex, blob_hex)
-    if not ok then error("blob hex: " .. tostring(blob), 0) end
+    local blob = blob_from_hex(blob_hex)
     local wire = read_file(infile)
-    local pipe <close> = itb.open(profile, blob)
+    local pipe <close> = itb.load(blob)
     local plain = is_streaming_profile(profile)
         and pipe:decrypt_stream_one_shot(wire)
         or pipe:decrypt_message(wire)
@@ -98,8 +105,8 @@ end
 
 local function main(argv)
     local known_shape =
-        (#argv == 1 and (argv[1] == "version" or argv[1] == "hashes"
-            or argv[1] == "profiles"))
+        (#argv == 1 and (argv[1] == "version" or argv[1] == "profiles"))
+        or (#argv == 2 and argv[1] == "inspect")
         or (#argv == 4 and argv[1] == "encrypt")
         or (#argv == 5 and argv[1] == "decrypt")
     if not known_shape then
@@ -112,10 +119,10 @@ local function main(argv)
         itb.set_gc_percent(20)
         if argv[1] == "version" then
             cmd_version()
-        elseif argv[1] == "hashes" then
-            cmd_hashes()
         elseif argv[1] == "profiles" then
             cmd_profiles()
+        elseif argv[1] == "inspect" then
+            cmd_inspect(argv[2])
         elseif argv[1] == "encrypt" then
             cmd_encrypt(argv[2], argv[3], argv[4])
         else

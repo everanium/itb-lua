@@ -54,22 +54,7 @@ end
 run("version", function()
     local v = itb.version()
     assert(type(v) == "string" and #v > 0, "empty version")
-    assert(itb._VERSION == "0.3.5")
-end)
-
-run("hashes canonical order", function()
-    local expected = {
-        "areion256", "areion512", "blake2b256", "blake2b512",
-        "blake2s", "blake3", "aescmac", "siphash24", "chacha20",
-    }
-    local got = itb.hashes()
-    assert(#got == #expected,
-        ("registry size %d, expected %d"):format(#got, #expected))
-    for i, name in ipairs(expected) do
-        assert(got[i].name == name,
-            ("row %d: %s, expected %s"):format(i, got[i].name, name))
-        assert(type(got[i].width) == "number" and got[i].width > 0)
-    end
+    assert(itb._VERSION == "0.4.1")
 end)
 
 run("profiles list", function()
@@ -97,7 +82,7 @@ end)
 
 run("message round trip (singlemsg-triple-mac-v1)", function()
     local sender <close> = itb.create("singlemsg-triple-mac-v1")
-    local receiver <close> = itb.open("singlemsg-triple-mac-v1", sender:blob())
+    local receiver <close> = itb.load(sender:save())
     for _, size in ipairs({ 1, 4 * 1024, 256 * 1024 }) do
         local plain = payload(size, size)
         local wire = sender:encrypt_message(plain)
@@ -109,7 +94,7 @@ end)
 
 run("stream round trip (streaming-noaead-triple-v1)", function()
     local sender <close> = itb.create("streaming-noaead-triple-v1")
-    local receiver <close> = itb.open("streaming-noaead-triple-v1", sender:blob())
+    local receiver <close> = itb.load(sender:save())
     local plain = payload(96 * 1024, 7)
 
     -- Encrypt incrementally: 8 KiB writes, then finish + drain.
@@ -138,7 +123,7 @@ end)
 
 run("pump helper round trip", function()
     local sender <close> = itb.create("streaming-noaead-triple-v1")
-    local receiver <close> = itb.open("streaming-noaead-triple-v1", sender:blob())
+    local receiver <close> = itb.load(sender:save())
     local plain = payload(64 * 1024 + 3, 11)
 
     local function reader_over(s)
@@ -169,19 +154,19 @@ run("pump helper round trip", function()
     assert(table.concat(back_parts) == plain, "pump round trip mismatch")
 end)
 
-run("large plaintext round trip (pattern P1, > 1 MiB)", function()
+run("large plaintext round trip (> 1 MiB)", function()
     local sender <close> = itb.create("singlemsg-triple-nomac-v1")
-    local receiver <close> = itb.open("singlemsg-triple-nomac-v1", sender:blob())
+    local receiver <close> = itb.load(sender:save())
     local plain = payload(2 * 1024 * 1024 + 17, 3)
     local wire = sender:encrypt_message(plain)
     assert(receiver:decrypt_message(wire) == plain)
 end)
 
-run("unknown profile maps to BAD_INPUT", function()
-    local err = assert_status({ itb.status.BAD_INPUT }, function()
+run("unknown profile maps to UNKNOWN_PROFILE", function()
+    local err = assert_status({ itb.status.UNKNOWN_PROFILE }, function()
         itb.create("no-such-profile")
     end)
-    assert(err.label == "invalid input")
+    assert(err.label == "unknown profile name")
 end)
 
 run("unknown opts key maps to BAD_INPUT", function()
@@ -194,7 +179,7 @@ end)
 
 run("tampered wire fails authentication", function()
     local sender <close> = itb.create("singlemsg-triple-mac-v1")
-    local receiver <close> = itb.open("singlemsg-triple-mac-v1", sender:blob())
+    local receiver <close> = itb.load(sender:save())
     local wire = sender:encrypt_message(payload(4096, 21))
     local i = #wire // 2
     local tampered = wire:sub(1, i - 1)
@@ -216,33 +201,111 @@ end)
 
 run("rekey refreshes the blob", function()
     local sender <close> = itb.create("singlemsg-triple-mac-v1")
-    local blob_before = sender:blob()
-    sender:rekey(payload(32, 5), payload(32, 6))
-    local blob_after = sender:blob()
+    local blob_before = sender:save()
+    local blob_after = sender:rekey(payload(32, 5), payload(32, 6))
     assert(blob_after ~= blob_before, "blob unchanged after rekey")
+    assert(sender:save() == blob_after, "save does not observe the rekey")
     -- The refreshed blob reconstructs a working receiver.
-    local receiver <close> = itb.open("singlemsg-triple-mac-v1", blob_after)
+    local receiver <close> = itb.load(blob_after)
     local wire = sender:encrypt_message("post-rekey payload")
     assert(receiver:decrypt_message(wire) == "post-rekey payload")
 end)
 
-run("register_profile round trip and duplicate", function()
-    local opts = itb.opts({
-        mode = "singlemsg-nomac",
-        width = "256",
-        innerHashes = "blake3,blake2s,areion256,blake2b256,chacha20,blake3,blake2s,areion256",
-        keyBits = "1024",
-        parallaxOn = "false",
-        wrapperOn = "false",
-    })
-    itb.register_profile("lua-binding-test-mixed", opts)
+run("register round trip and duplicate", function()
+    local profile = [[{
+        "mode": "singlemsg-nomac",
+        "width": 256,
+        "hashes": ["blake3", "blake2s", "areion256", "blake2b256",
+                   "chacha20", "blake3", "blake2s", "areion256"],
+        "keybits": 1024,
+        "parallax": false,
+        "wrapper": false
+    }]]
+    itb.register("lua-binding-test-mixed", profile)
+    local seen = false
+    for _, name in ipairs(itb.profiles()) do
+        if name == "lua-binding-test-mixed" then seen = true end
+    end
+    assert(seen, "registered profile missing from itb.profiles()")
+    assert(itb.lookup("lua-binding-test-mixed"):find('"hashes":["blake3"', 1, true),
+        "lookup record lacks the hashes constellation")
     local sender <close> = itb.create("lua-binding-test-mixed")
-    local receiver <close> = itb.open("lua-binding-test-mixed", sender:blob())
+    local receiver <close> = itb.load(sender:save())
     local wire = sender:encrypt_message("custom profile")
     assert(receiver:decrypt_message(wire) == "custom profile")
     assert_status({ itb.status.PROFILE_EXISTS }, function()
-        itb.register_profile("lua-binding-test-mixed", opts)
+        itb.register("lua-binding-test-mixed", profile)
     end)
+    -- Strict record decode on the Go side: an unknown key is
+    -- rejected there, not by the binding.
+    assert_status({ itb.status.BAD_INPUT }, function()
+        itb.register("lua-binding-test-badkey", '{"mode":"singlemsg-nomac","bogus":1}')
+    end)
+end)
+
+run("save / load round trip", function()
+    local sender <close> = itb.create("singlemsg-triple-mac-v1")
+    local blob = sender:save()
+    assert(#blob > 0 and sender:save() == blob, "save is not stable")
+    local receiver <close> = itb.load(blob)
+    assert(receiver:save() == blob, "load did not retain the blob")
+    local wire = sender:encrypt_message("in-memory persist")
+    assert(receiver:decrypt_message(wire) == "in-memory persist")
+end)
+
+run("save_f / load_f round trip", function()
+    local path = os.tmpname()
+    os.remove(path)
+    local sender <close> = itb.create("singlemsg-triple-mac-v1")
+    sender:save_f(path)
+    local f = assert(io.open(path, "rb"))
+    local on_disk = f:read("a")
+    f:close()
+    assert(on_disk == sender:save(), "file content differs from save()")
+    local receiver <close> = itb.load_f(path)
+    assert(receiver:save() == sender:save())
+    local wire = sender:encrypt_message("file persist")
+    assert(receiver:decrypt_message(wire) == "file persist")
+    os.remove(path)
+    assert_status({ itb.status.BAD_INPUT }, function() itb.load_f(path) end)
+end)
+
+run("load with master override", function()
+    local sender <close> = itb.create("singlemsg-triple-mac-v1")
+    local rotated = sender:rekey(payload(32, 8), payload(32, 10))
+    local receiver <close> = itb.load(sender:save(), payload(32, 8), payload(32, 10))
+    assert(receiver:save() == rotated)
+    local wire = sender:encrypt_message("master override")
+    assert(receiver:decrypt_message(wire) == "master override")
+end)
+
+run("inspect / lookup / profiles", function()
+    local pipe <close> = itb.create("singlemsg-triple-mac-v1")
+    local record = itb.inspect(pipe:save())
+    assert(record:find('"name":"singlemsg-triple-mac-v1"', 1, true), record)
+    assert(record:find('"mode":"singlemsg-mac"', 1, true), record)
+    assert(record == itb.lookup("singlemsg-triple-mac-v1"), "inspect differs from lookup")
+    assert_status({ itb.status.BAD_INPUT }, function() itb.inspect("not a blob") end)
+    assert_status({ itb.status.UNKNOWN_PROFILE }, function() itb.lookup("no-such-profile") end)
+    local names = itb.profiles()
+    assert(#names > 0)
+    for i = 2, #names do
+        assert(names[i - 1] < names[i], "profiles() is not sorted")
+    end
+end)
+
+run("max_workers", function()
+    local pipe <close> = itb.create("singlemsg-triple-mac-v1")
+    pipe:max_workers(2)
+    pipe:max_workers(-1)     -- clamped to auto, never rejected
+    pipe:max_workers(10000)  -- clamped to 256
+    local wire = pipe:encrypt_message("after cap change")
+    assert(pipe:decrypt_message(wire) == "after cap change")
+    pipe:close()
+    assert_status({ itb.status.TRIPLE_CLOSED }, function() pipe:max_workers(2) end)
+    -- A negative init-time cap is clamped as well.
+    local neg <close> = itb.create("singlemsg-triple-mac-v1", itb.opts({ max_workers = -1 }))
+    assert(neg:decrypt_message(neg:encrypt_message("negative cap")) == "negative cap")
 end)
 
 run("stream session pins its parent pipeline against GC", function()
