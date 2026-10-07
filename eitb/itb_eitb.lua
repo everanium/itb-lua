@@ -1,11 +1,11 @@
---- itb_eitb.lua — command-line demonstrator for the ITB Lua binding.
+--- Command-line demonstrator for the ITB Lua binding.
 --
 -- Subcommands:
 --
---     itb_eitb.lua version                                library + binding versions
---     itb_eitb.lua profiles                               registered profile catalogue
---     itb_eitb.lua inspect <blob-hex>                     profile record of a blob
---     itb_eitb.lua encrypt <profile> <in-file> <out-file> Single Message encrypt
+--     itb_eitb.lua version
+--     itb_eitb.lua profiles
+--     itb_eitb.lua inspect <blob-hex>
+--     itb_eitb.lua encrypt <profile> <in-file> <out-file>
 --     itb_eitb.lua decrypt <profile> <blob-hex> <in-file> <out-file>
 --
 -- `encrypt` prints the session blob (`pipe:save()`) to stderr as hex;
@@ -14,6 +14,7 @@
 -- routes Single Message versus streaming). `profiles` lists the
 -- registered profile catalogue one name per line; the profiles that
 -- carry a cipher surface are the ones `encrypt` / `decrypt` accept.
+-- `inspect` prints the profile record a blob carries.
 
 local itb = require "itb3"
 

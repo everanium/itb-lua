@@ -1,0 +1,5 @@
+# The utility has no compiled artefact of its own; this keeps any
+# byte-code a future toolchain might drop here out of the index even
+# when the tree is consumed outside the repository root.
+*.luac
+luac.out

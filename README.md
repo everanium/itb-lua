@@ -13,7 +13,7 @@ API; no LuaJIT, no FFI library). The compiled `libitb3_lua.so` module links
 profile-name is an opaque string passed through to Go for validation —
 the binding carries no ITB construction logic. The public surface is a
 `Pipeline` userdata (create / load / load_f / save / save_f / rekey /
-max_workers / close, Single Message encrypt / decrypt, whole-buffer
+max_workers / close, Single Message encrypt / decrypt, one-shot
 and incremental stream sessions), an opts query-string builder for
 `create`, the profile-catalogue functions (`inspect` / `register` /
 `lookup` / `profiles`), and the Go runtime knobs.
@@ -62,9 +62,10 @@ standard Lua C-module convention).
   module `lua/itb3.lua` loads first; it locates the compiled `libitb3_lua.so`
   next to itself via `package.loadlib` and re-exports the C surface
   plus the pure-Lua helpers (`opts`, `tohex` / `fromhex`, `pump`).
-- With only `LUA_CPATH` pointing at `bindings/lua/lua/?.so`, the C
-  core loads directly; its surface is complete on its own (the sugar
-  helpers are then unavailable).
+- `LUA_CPATH` plays no part in resolving `require "itb3"`: the
+  compiled C core carries its own basename (`libitb3_lua.so`), so it
+  never answers to that name; the sugar module loads it by explicit
+  path, and the merged table is what `require "itb3"` returns.
 
 The run scripts set both paths.
 
@@ -111,6 +112,50 @@ local rotated = sender:rekey(string.rep("\x11", 32), string.rep("\x22", 32))
 local receiver = itb.load(rotated)
 ```
 
+`Pipeline` and stream-session userdata are to-be-closed values, so a
+`local pipe <close> = itb.create(...)` declaration frees the Go-side
+handle deterministically at scope exit (garbage collection via `__gc`
+covers the plain-local path). Lua strings are the byte-buffer type
+throughout: inputs and outputs are ordinary (possibly
+embedded-zero-carrying) Lua strings.
+
+Incremental streaming:
+
+```lua
+local pipe <close> = itb.create("streaming-noaead-triple-v1")
+local sess <close> = pipe:encrypt_stream()
+sess:write(part1)
+sess:write(part2)
+local wire = sess:drain_all()      -- finish + drain in one call
+```
+
+The explicit loop form is `write` / `finish` / `read` (`finish` is the
+end-of-input signal — named so because `end` is a Lua keyword);
+`read([max])` returns `chunk, finished` and never blocks before
+`finish`. The `itb.pump(sess, read_fn, write_fn)` helper moves bytes
+through a session with bounded memory. A stream session holds a
+reference to its parent `Pipeline` in its uservalue, so the Lua GC
+cannot collect the Pipeline while the session is live.
+
+Errors are raised as objects — tables `{status=<int>,
+message=<string>}` with a `__tostring` metamethod — so `pcall` callers
+branch on `err.status` against the `itb.status` constant table, while
+`err.message` carries the libitb3 diagnostic:
+
+```lua
+local ok, err = pcall(function() return itb.create("no-such-profile") end)
+assert(err.status == itb.status.UNKNOWN_PROFILE)
+```
+
+Options are URL-query strings built with `itb.opts{...}` (snake_case
+keys map onto the Go opts grammar; unknown keys pass through
+verbatim):
+
+```lua
+local opts = itb.opts({ nonce_bits = 512, key_bits = 1024, chunk_size = 65536 })
+local pipe = itb.create("streaming-aead-triple-mac-v1", opts)
+```
+
 ## Persisting sessions
 
 The blob is self-describing: it carries the profile record (mode,
@@ -140,6 +185,12 @@ same name before opening. Attempting to `load` such a blob through
 this binding raises an error object with
 `err.status == itb.status.RECIPE_PRIMITIVE_UNKNOWN`.
 
+**Runtime tuning.** `pipe:max_workers(n)` sets the worker cap on a
+live Pipeline (`n <= 0` selects auto, values above 256 are clamped).
+The cap is per-machine tuning and is never written to the blob, so
+the receiver may pick its own worker cap after `load`. The
+`max_workers` opts key sets the same cap at `create`.
+
 ## Profile registry
 
 ```lua
@@ -162,57 +213,6 @@ local sender = itb.create("my-profile")
 empty or equal to the name argument. Every rule — name pattern,
 reserved prefixes, field constraints, primitive names — is enforced
 by libitb3; a duplicate name raises `itb.status.PROFILE_EXISTS`.
-
-## Runtime tuning
-
-`pipe:max_workers(n)` sets the worker cap on a live Pipeline
-(`n <= 0` selects auto, values above 256 are clamped). The cap is
-per-machine tuning and is never written to the blob, so the receiver
-may pick its own worker cap after `load`. The `max_workers` opts key
-sets the same cap at `create`.
-
-`Pipeline` and stream-session userdata are to-be-closed values, so a
-`local pipe <close> = itb.create(...)` declaration frees the Go-side
-handle deterministically at scope exit (garbage collection via `__gc`
-covers the plain-local path). Lua strings are the byte-buffer type
-throughout: inputs and outputs are ordinary (possibly
-embedded-zero-carrying) Lua strings.
-
-Incremental streaming:
-
-```lua
-local pipe <close> = itb.create("streaming-noaead-triple-v1")
-local sess <close> = pipe:encrypt_stream()
-sess:write(part1)
-sess:write(part2)
-local wire = sess:drain_all()      -- finish + drain in one call
-```
-
-The explicit loop form is `write` / `finish` / `read` (`finish` is the
-end-of-input signal — named so because `end` is a Lua keyword);
-`read([max])` returns `chunk, finished` and never blocks before
-`finish`. The `itb.pump(sess, read_fn, write_fn)` helper moves bytes
-through a session with bounded memory. A stream session holds a
-reference to its parent `Pipeline` in its uservalue, so the Lua GC
-cannot collect the Pipeline while the session is live.
-
-Errors are raised as objects — tables `{status=<int>, label=<string>,
-message=<string>}` with a `__tostring` metamethod — so `pcall` callers
-branch on `err.status` against the `itb.status` constant table:
-
-```lua
-local ok, err = pcall(function() return itb.create("no-such-profile") end)
-assert(err.status == itb.status.UNKNOWN_PROFILE)
-```
-
-Options are URL-query strings built with `itb.opts{...}` (snake_case
-keys map onto the Go opts grammar; unknown keys pass through
-verbatim):
-
-```lua
-local opts = itb.opts({ nonce_bits = 512, key_bits = 1024, chunk_size = 65536 })
-local pipe = itb.create("streaming-aead-triple-mac-v1", opts)
-```
 
 `itb.profiles()` returns every registered Triple profile name (shipped
 catalogue plus `itb.register` additions), sorted.
@@ -239,7 +239,7 @@ itb.set_gc_percent(100)                       -- balanced GC
 ```
 
 Assert-based suite (no external test framework): version check, Single
-Message and incremental Streaming round trips, the pump helper, a
+Message and incremental streaming round trips, the pump helper, a
 > 1 MiB payload, error mapping (unknown profile, unknown opts key,
 tampered wire, closed Pipeline, duplicate profile registration), rekey
 blob refresh, save / load persistence (in memory and through a file),
@@ -253,14 +253,16 @@ the opts / hex helpers.
 ITB_BENCH_MIN_SEC=1 ./bindings/lua/run_bench.sh   # quick smoke
 ```
 
-Single Message encrypt and incremental Streaming encrypt (No MAC
-profiles) at 1 MiB / 16 MiB / 64 MiB, configured through the fleet's
+Single Message encrypt, incremental streaming encrypt and one-shot
+Streaming encrypt (No MAC profiles) at 1 MiB / 16 MiB / 64 MiB,
+configured through the fleet's
 canonical env vars (`ITB_INNER_HASH`, `ITB_KEY_BITS`,
 `ITB_NONCE_BITS`, `ITB_WITH_PARALLAX`, `ITB_WITH_WRAPPER`,
 `ITB_PROFILE`, `ITB_BENCH_MIN_SEC`); the harness caps the Go runtime
 via `itb.set_memory_limit(4 * 1024 * 1024 * 1024)` and
-`itb.set_gc_percent(100)`. See `bindings/BENCH.md` for the fleet-wide
-configuration authority and comparison tables.
+`itb.set_gc_percent(100)`. See
+[`bindings/BENCH.md`](https://github.com/everanium/itb/blob/main/bindings/BENCH.md)
+for the fleet-wide configuration authority and comparison tables.
 
 ## itb3 CLI
 
@@ -272,6 +274,27 @@ payloads directly on disk (`-i` / `-o`) or through stdin / stdout,
 rotates outer masters, and inspects stored blobs. See
 [`cmd/itb3/README.md`](https://github.com/everanium/itb/blob/main/cmd/itb3/README.md) for the full
 subcommand reference.
+
+## loop utility
+
+A long-run stress harness under `bindings/lua/loop/` holds one
+Pipeline handle for minutes, cycles encrypt → decrypt → compare
+round-trips through it, rotates the outer masters and reopens the
+handle from its session blob on a schedule, and reports whether the
+process survived with every byte intact. It is the binding-side
+counterpart of the Go harness under `tools/loop`: same flags, same
+round structure, same summary in both renderings.
+
+```bash
+./bindings/lua/build.sh
+./bindings/lua/run_loop.sh --duration 2m --shape both
+```
+
+`./bindings/lua/run_loop.sh -h` lists every flag. Concurrency mode:
+**single** — a stock Lua 5.4 interpreter is one thread around one
+`lua_State` and its standard library offers no thread primitive, only
+cooperative coroutines, so `--goroutines` above 1 is clamped to 1 and
+the summary reports the effective count next to the requested one.
 
 ## eitb utility
 
@@ -304,7 +327,7 @@ Message versus streaming).
   return, and `itb.register` accepts, the record as the JSON string
   libitb3 exchanges; Lua ships no JSON codec, so decoding into a table
   is left to the caller's library of choice.
-- **Streaming decrypt caveat.** Chunked Streaming AEAD verifies per
+- **Streaming-decrypt caveat.** Chunked Streaming AEAD verifies per
   chunk, so plaintext of verified chunks is released before a later
   chunk can fail authentication.
 - The binding exposes the Triple Pipeline surface only; the Low-Level

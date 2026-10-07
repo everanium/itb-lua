@@ -1,6 +1,6 @@
 /*
- * itb3_lua.c — Lua 5.4 C module over the libitb3 shared library's
- * Triple Pipeline surface (ITB_Triple_*, cmd/cshared).
+ * Lua 5.4 C module over the libitb3 shared library's Triple Pipeline
+ * surface (ITB_Triple_*, cmd/cshared).
  *
  * The module is a thin proxy: every hash-name / MAC-name / cipher-name
  * / profile-name is an opaque string passed through to Go for
@@ -17,9 +17,15 @@
  *   itb.register(name, profile_json)
  *   itb.lookup(name)                        -> profile-record JSON string
  *   itb.profiles()                          -> { "blob-triple-mac-v1", ... } (sorted)
+ *   itb.hash_names()                        -> { "aesitb128", ... } (registry order)
  *   itb.version()                           -> string
+ *   itb.drbg_auto_tier()                    -> "aes-256-ctr" | "chacha20"
  *   itb.set_memory_limit(bytes)             -> previous limit
  *   itb.set_gc_percent(pct)                 -> previous percent
+ *   itb.set_gomaxprocs(n)                   -> previous value (n <= 0 queries)
+ *   itb.write_heap_profile(path)
+ *   itb.pool_stats_len()                    -> slot count
+ *   itb.pool_stats()                        -> { int64, ... }
  *   itb.now()                               -> monotonic seconds (number)
  *   itb.status                              -> { OK=0, BAD_INPUT=4, ... }
  *
@@ -38,12 +44,12 @@
  * reference to its parent Pipeline userdata, so the Lua GC cannot
  * collect (and thereby free) the Pipeline while the session is live.
  *
- * Errors are raised as table objects {status=int, label=string,
- * message=string} with a __tostring metamethod, so pcall callers can
- * branch on err.status against itb.status.*.
+ * Errors are raised as table objects {status=int, message=string}
+ * with a __tostring metamethod, so pcall callers can branch on
+ * err.status against itb.status.*.
  *
  * Output-buffer discipline: variable-size outputs pre-allocate
- * len + len/4 + 65536 bytes and retry once with the exact reported
+ * len + len/4 + 131072 bytes and retry once with the exact reported
  * size when the call returns BUFFER_TOO_SMALL with outLen > cap.
  */
 
@@ -100,46 +106,34 @@ enum {
 
 typedef struct {
     int code;
-    const char *name;  /* itb.status key */
-    const char *label; /* human-readable */
+    const char *name; /* itb.status key */
 } status_row;
 
 static const status_row STATUS_ROWS[] = {
-    {ST_OK, "OK", "ok"},
-    {ST_BAD_HASH, "BAD_HASH", "unknown hash name"},
-    {ST_BAD_KEY_BITS, "BAD_KEY_BITS", "invalid key bits"},
-    {ST_BAD_HANDLE, "BAD_HANDLE", "invalid handle"},
-    {ST_BAD_INPUT, "BAD_INPUT", "invalid input"},
-    {ST_BUFFER_TOO_SMALL, "BUFFER_TOO_SMALL", "output buffer too small"},
-    {ST_ENCRYPT_FAILED, "ENCRYPT_FAILED", "encrypt failed"},
-    {ST_DECRYPT_FAILED, "DECRYPT_FAILED", "decrypt failed"},
-    {ST_SEED_WIDTH_MIX, "SEED_WIDTH_MIX", "seed width mismatch"},
-    {ST_BAD_MAC, "BAD_MAC", "unknown MAC name or invalid MAC handle"},
-    {ST_MAC_FAILURE, "MAC_FAILURE", "MAC verification failed"},
-    {ST_BLOB_MALFORMED_RECIPE, "BLOB_MALFORMED_RECIPE", "blob profile record invalid"},
-    {ST_RECIPE_PRIMITIVE_UNKNOWN, "RECIPE_PRIMITIVE_UNKNOWN",
-     "blob profile record names a primitive absent from the local registries"},
-    {ST_UNKNOWN_PROFILE, "UNKNOWN_PROFILE", "unknown profile name"},
-    {ST_BLOB_MODE_MISMATCH, "BLOB_MODE_MISMATCH", "blob mode mismatch"},
-    {ST_BLOB_MALFORMED, "BLOB_MALFORMED", "malformed state blob"},
-    {ST_BLOB_VERSION_TOO_NEW, "BLOB_VERSION_TOO_NEW", "blob version too new"},
-    {ST_BLOB_TOO_MANY_OPTS, "BLOB_TOO_MANY_OPTS", "too many blob export opts"},
-    {ST_STREAM_TRUNCATED, "STREAM_TRUNCATED", "stream truncated before terminator"},
-    {ST_STREAM_AFTER_FINAL, "STREAM_AFTER_FINAL", "stream chunk after terminator"},
-    {ST_TRIPLE_CLOSED, "TRIPLE_CLOSED", "Triple Pipeline is closed"},
-    {ST_PROFILE_EXISTS, "PROFILE_EXISTS", "profile name already registered"},
-    {ST_INTERNAL, "INTERNAL", "internal error"},
+    {ST_OK, "OK"},
+    {ST_BAD_HASH, "BAD_HASH"},
+    {ST_BAD_KEY_BITS, "BAD_KEY_BITS"},
+    {ST_BAD_HANDLE, "BAD_HANDLE"},
+    {ST_BAD_INPUT, "BAD_INPUT"},
+    {ST_BUFFER_TOO_SMALL, "BUFFER_TOO_SMALL"},
+    {ST_ENCRYPT_FAILED, "ENCRYPT_FAILED"},
+    {ST_DECRYPT_FAILED, "DECRYPT_FAILED"},
+    {ST_SEED_WIDTH_MIX, "SEED_WIDTH_MIX"},
+    {ST_BAD_MAC, "BAD_MAC"},
+    {ST_MAC_FAILURE, "MAC_FAILURE"},
+    {ST_BLOB_MALFORMED_RECIPE, "BLOB_MALFORMED_RECIPE"},
+    {ST_RECIPE_PRIMITIVE_UNKNOWN, "RECIPE_PRIMITIVE_UNKNOWN"},
+    {ST_UNKNOWN_PROFILE, "UNKNOWN_PROFILE"},
+    {ST_BLOB_MODE_MISMATCH, "BLOB_MODE_MISMATCH"},
+    {ST_BLOB_MALFORMED, "BLOB_MALFORMED"},
+    {ST_BLOB_VERSION_TOO_NEW, "BLOB_VERSION_TOO_NEW"},
+    {ST_BLOB_TOO_MANY_OPTS, "BLOB_TOO_MANY_OPTS"},
+    {ST_STREAM_TRUNCATED, "STREAM_TRUNCATED"},
+    {ST_STREAM_AFTER_FINAL, "STREAM_AFTER_FINAL"},
+    {ST_TRIPLE_CLOSED, "TRIPLE_CLOSED"},
+    {ST_PROFILE_EXISTS, "PROFILE_EXISTS"},
+    {ST_INTERNAL, "INTERNAL"},
 };
-
-static const char *status_label(int code) {
-    size_t i;
-    for (i = 0; i < sizeof(STATUS_ROWS) / sizeof(STATUS_ROWS[0]); i++) {
-        if (STATUS_ROWS[i].code == code) {
-            return STATUS_ROWS[i].label;
-        }
-    }
-    return "unknown status";
-}
 
 /* ---- error raising ------------------------------------------------ */
 
@@ -165,13 +159,11 @@ static void push_last_error(lua_State *L) {
     }
 }
 
-/* Raises an error object {status, label, message} (never returns). */
+/* Raises an error object {status, message} (never returns). */
 static int raise_status(lua_State *L, int rc) {
-    lua_createtable(L, 0, 3);
+    lua_createtable(L, 0, 2);
     lua_pushinteger(L, rc);
     lua_setfield(L, -2, "status");
-    lua_pushstring(L, status_label(rc));
-    lua_setfield(L, -2, "label");
     push_last_error(L);
     lua_setfield(L, -2, "message");
     luaL_setmetatable(L, ERROR_MT);
@@ -180,21 +172,14 @@ static int raise_status(lua_State *L, int rc) {
 
 static int l_error_tostring(lua_State *L) {
     lua_Integer st;
-    const char *label, *msg;
+    const char *msg;
     luaL_checktype(L, 1, LUA_TTABLE);
-    lua_getfield(L, 1, "label");
     lua_getfield(L, 1, "status");
     lua_getfield(L, 1, "message");
-    label = lua_tostring(L, -3);
     st = lua_tointeger(L, -2);
     msg = lua_tostring(L, -1);
-    if (label == NULL) label = "unknown status";
     if (msg == NULL) msg = "";
-    if (*msg != '\0') {
-        lua_pushfstring(L, "itb: %s (status %d): %s", label, (int)st, msg);
-    } else {
-        lua_pushfstring(L, "itb: %s (status %d)", label, (int)st);
-    }
+    lua_pushfstring(L, "itb: status=%d: %s", (int)st, msg);
     return 1;
 }
 
@@ -229,8 +214,8 @@ static lstream *check_stream(lua_State *L, int idx) {
 
 /* Pre-allocation formula for message / one-shot stream outputs. */
 static size_t out_cap(size_t payload) {
-    size_t cap = payload + payload / 4 + 65536;
-    return cap < 65536 ? 65536 : cap;
+    size_t cap = payload + payload / 4 + 131072;
+    return cap < 131072 ? 131072 : cap;
 }
 
 typedef int (*cipher_fn)(uintptr_t, void *, size_t, void *, size_t, size_t *);
@@ -465,6 +450,34 @@ static int l_version(lua_State *L) {
     return 1;
 }
 
+/* itb.drbg_auto_tier() -> string: the fill cipher the auto DRBG tier
+ * selected on this host ("aes-256-ctr" or "chacha20") — the tier a
+ * Pipeline uses when its drbg option is empty, resolved per host and
+ * recorded in no blob. */
+static int l_drbg_auto_tier(lua_State *L) {
+    size_t need = 0;
+    int rc = ITB_DRBGAutoTier(NULL, 0, &need);
+    if (rc != ST_OK && rc != ST_BUFFER_TOO_SMALL) {
+        return raise_status(L, rc);
+    }
+    if (need <= 1) {
+        lua_pushliteral(L, "");
+        return 1;
+    }
+    {
+        luaL_Buffer b;
+        char *p = luaL_buffinitsize(L, &b, need);
+        rc = ITB_DRBGAutoTier(p, need, &need);
+        if (rc != ST_OK) {
+            luaL_pushresultsize(&b, 0);
+            lua_pop(L, 1);
+            return raise_status(L, rc);
+        }
+        luaL_pushresultsize(&b, need > 0 ? need - 1 : 0);
+    }
+    return 1;
+}
+
 /* itb.profiles() -> sorted array of every registered profile name.
  * libitb3 writes a JSON array of strings; profile names are restricted
  * to [a-z0-9-] so the array unpacks by scanning the quoted items. */
@@ -516,6 +529,108 @@ static int l_now(lua_State *L) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     lua_pushnumber(L, (lua_Number)ts.tv_sec + (lua_Number)ts.tv_nsec * 1e-9);
+    return 1;
+}
+
+/* itb.set_gomaxprocs(n) -> previous value. n <= 0 queries without
+ * changing, so the caller reads the effective value the same way it
+ * sets one. ITB_GOMAXPROCS in the environment applies at library load
+ * time and is left standing by a query. */
+static int l_set_gomaxprocs(lua_State *L) {
+    lua_Integer n = luaL_checkinteger(L, 1);
+    lua_pushinteger(L, (lua_Integer)ITB_SetGOMAXPROCS((int)n));
+    return 1;
+}
+
+/* itb.write_heap_profile(path) — writes a Go runtime heap profile
+ * (pprof format) to path after one forced collection. */
+static int l_write_heap_profile(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    int rc = ITB_WriteHeapProfile(MUT(path));
+    if (rc != ST_OK) {
+        return raise_status(L, rc);
+    }
+    return 0;
+}
+
+/* itb.pool_stats_len() -> the number of int64 slots pool_stats fills. */
+static int l_pool_stats_len(lua_State *L) {
+    lua_pushinteger(L, (lua_Integer)ITB_PoolStatsLen());
+    return 1;
+}
+
+/* itb.pool_stats() -> array of the shared library's pool counters.
+ * Every counter is a monotonically increasing total since library
+ * load; a caller differences two snapshots. The vector is sized from
+ * pool_stats_len rather than from a constant, because the slot count
+ * follows the number of hash-array pool tiers the library ships. */
+static int l_pool_stats(lua_State *L) {
+    int want = ITB_PoolStatsLen();
+    size_t cap;
+    size_t n = 0;
+    int64_t *buf;
+    int rc;
+    size_t i;
+    if (want <= 0) {
+        lua_createtable(L, 0, 0);
+        return 1;
+    }
+    cap = (size_t)want;
+    /* C-specific. The scratch vector is a Lua-owned full userdata
+     * rather than malloc: it sits on the stack for the whole call, so
+     * the collector keeps it reachable while the library writes into
+     * it, and an error raised below unwinds without leaking it. */
+    buf = (int64_t *)lua_newuserdatauv(L, cap * sizeof(int64_t), 0);
+    rc = ITB_PoolStats(buf, cap, &n);
+    if (rc != ST_OK) {
+        lua_pop(L, 1);
+        return raise_status(L, rc);
+    }
+    if (n > cap) {
+        n = cap;
+    }
+    lua_createtable(L, (int)n, 0);
+    for (i = 0; i < n; i++) {
+        lua_pushinteger(L, (lua_Integer)buf[i]);
+        lua_rawseti(L, -2, (lua_Integer)(i + 1));
+    }
+    lua_remove(L, -2); /* drop the scratch userdata, keep the array */
+    return 1;
+}
+
+static int hash_names_thunk(void *ctx, void *out, size_t cap, size_t *n) {
+    (void)ctx;
+    return ITB_Triple_HashNames(out, cap, n);
+}
+
+/* itb.hash_names() -> array of every shipped inner-hash primitive
+ * name, in registry order. libitb3 writes a JSON array of strings;
+ * primitive names are restricted to [a-z0-9-] so the array unpacks by
+ * scanning the quoted items, exactly as profiles() does. */
+static int l_hash_names(lua_State *L) {
+    size_t len = 0;
+    const char *json;
+    const char *p;
+    lua_Integer i = 0;
+    buf_call(L, hash_names_thunk, NULL, JSON_CAP);
+    json = lua_tolstring(L, -1, &len);
+    lua_createtable(L, 0, 0);
+    p = json;
+    while (p < json + len) {
+        const char *q = memchr(p, '"', (size_t)(json + len - p));
+        const char *e;
+        if (q == NULL) {
+            break;
+        }
+        e = memchr(q + 1, '"', (size_t)(json + len - (q + 1)));
+        if (e == NULL) {
+            break;
+        }
+        lua_pushlstring(L, q + 1, (size_t)(e - (q + 1)));
+        lua_rawseti(L, -2, ++i);
+        p = e + 1;
+    }
+    lua_remove(L, -2); /* drop the JSON text, keep the array */
     return 1;
 }
 
@@ -794,9 +909,15 @@ static const luaL_Reg MODULE_FUNCS[] = {
     {"lookup", l_lookup},
     {"profiles", l_profiles},
     {"version", l_version},
+    {"drbg_auto_tier", l_drbg_auto_tier},
     {"set_memory_limit", l_set_memory_limit},
     {"set_gc_percent", l_set_gc_percent},
     {"now", l_now},
+    {"set_gomaxprocs", l_set_gomaxprocs},
+    {"write_heap_profile", l_write_heap_profile},
+    {"pool_stats_len", l_pool_stats_len},
+    {"pool_stats", l_pool_stats},
+    {"hash_names", l_hash_names},
     {NULL, NULL},
 };
 

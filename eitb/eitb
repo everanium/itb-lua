@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# eitb -- launcher for the eitb CLI. Builds the Lua C module on first
-# use (or after a clean), then forwards every argument to the Lua
-# entry point.
+# Launcher for the eitb CLI. Builds the Lua C module on first use (or
+# after a clean), then forwards every argument to the Lua entry
+# point.
 
 set -eu
 set -o pipefail

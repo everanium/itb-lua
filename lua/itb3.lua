@@ -1,4 +1,4 @@
---- itb3.lua — Lua-side sugar over the libitb3 C module (libitb3_lua.so).
+--- Lua-side sugar over the libitb3 C module (libitb3_lua.so).
 --
 -- Loads the compiled C core located next to this file and re-exports
 -- its surface plus pure-Lua conveniences:
@@ -49,6 +49,7 @@ local KEY_MAP = {
     mac_name = "macName",
     inner_hash = "innerHash",
     outer_cipher = "outerCipher",
+    drbg = "drbg",
     parallax_palette = "parallaxPalette",
     perm_master = "pm",
     wrap_master = "wm",

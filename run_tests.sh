@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# run_tests.sh -- one-step test runner for the Lua binding. Builds the
-# C module via build.sh, then runs the assert-based test suite under
-# the Lua 5.4 interpreter.
+# One-step test runner for the Lua binding. Builds the C module via
+# build.sh, then runs the assert-based test suite under the Lua 5.4
+# interpreter.
 #
 # Usage:
 #   ./run_tests.sh

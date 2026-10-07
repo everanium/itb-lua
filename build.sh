@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# build.sh -- one-step build for the Lua binding: (re)builds libitb3.so
-# if absent (or when ITB_REBUILD_LIBITB3=1), then compiles the Lua 5.4
-# C module lua/libitb3_lua.so. Prerequisites (Go, gcc, make, Lua 5.4 headers)
-# must be installed separately; see README.md "Prerequisites".
+# One-step build for the Lua binding: (re)builds libitb3.so if absent (or
+# when ITB_REBUILD_LIBITB3=1), then compiles the Lua 5.4 C module
+# lua/libitb3_lua.so. Prerequisites (Go, gcc, make, Lua 5.4 headers) must be
+# installed separately; see README.md "Prerequisites".
 #
 # Every artefact this binding owns is removed before the build, so
 # nothing in the tree predates the invocation. lua/libitb3_lua.so is
@@ -129,5 +129,17 @@ if [[ ! -f lua/libitb3_lua.so ]]; then
     echo "build.sh: lua/libitb3_lua.so was not produced" >&2
     exit 1
 fi
+
+echo "==> syntax-checking the Lua sources, the tests, the bench, eitb and loop"
+LUAC="${LUAC:-luac5.4}"
+if ! command -v "$LUAC" >/dev/null 2>&1; then
+    LUAC=luac
+fi
+# The loop utility and the other Lua sources compile to nothing on
+# disk, so the build's part in owning them is proving they parse: -p
+# checks a chunk and writes no output. A stale artefact is impossible
+# where there is no artefact, which is why the wipe above needs no
+# entry for them.
+"$LUAC" -p lua/*.lua tests/*.lua bench/*.lua eitb/*.lua loop/*.lua
 
 echo "==> ready: ./run_tests.sh"

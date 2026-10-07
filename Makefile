@@ -1,4 +1,4 @@
-# Makefile — build for the ITB Lua binding (Lua 5.4 C module).
+# Build for the ITB Lua binding (Lua 5.4 C module).
 #
 # Targets:
 #   all (default):  lua/libitb3_lua.so — the C module, loadable via require "itb3".

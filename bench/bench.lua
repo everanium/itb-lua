@@ -1,6 +1,6 @@
---- bench.lua — micro-benchmarks for the ITB Lua binding.
+--- Micro-benchmarks for the ITB Lua binding.
 --
--- Single Message encrypt and incremental Streaming encrypt throughput
+-- Single Message encrypt and incremental streaming encrypt throughput
 -- at 1 MiB / 16 MiB / 64 MiB. Wall-clock via the module's monotonic
 -- itb.now() (os.clock reports process CPU time, which over-counts the
 -- Go runtime's worker threads); output is a fixed-width table:
@@ -163,9 +163,9 @@ local function stream_encrypt_all(pipe, plain)
 end
 
 local function main()
-    -- Bench-scale allocation churn leaks Go scratch heap unboundedly
-    -- without a soft memory cap + aggressive GC; the return values
-    -- report the previous settings, not an error.
+    -- Bench-scale allocation churn grows the Go scratch heap
+    -- unboundedly without a soft memory cap + aggressive GC; the
+    -- return values report the previous settings, not an error.
     itb.set_memory_limit(4 * 1024 * 1024 * 1024)
     itb.set_gc_percent(100)
 

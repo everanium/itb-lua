@@ -1,4 +1,4 @@
---- test_itb.lua — assert-based test suite for the ITB Lua binding.
+--- Assert-based test suite for the ITB Lua binding.
 --
 -- Plain Lua 5.4 asserts (no external test framework dependency); each
 -- case prints "ok - <name>" on success, and the process exits non-zero
@@ -45,8 +45,7 @@ local function assert_status(expected, fn)
             return err
         end
     end
-    error(("unexpected status %d (%s): %s"):format(
-        err.status, tostring(err.label), tostring(err)))
+    error(("unexpected status %d: %s"):format(err.status, tostring(err)))
 end
 
 -- ---------------------------------------------------------------------
@@ -55,6 +54,11 @@ run("version", function()
     local v = itb.version()
     assert(type(v) == "string" and #v > 0, "empty version")
     assert(itb._VERSION == "0.5.1")
+end)
+
+run("drbg auto tier", function()
+    local tier = itb.drbg_auto_tier()
+    assert(tier == "aes-256-ctr" or tier == "chacha20", "drbg auto tier: " .. tostring(tier))
 end)
 
 run("profiles list", function()
@@ -166,7 +170,7 @@ run("unknown profile maps to UNKNOWN_PROFILE", function()
     local err = assert_status({ itb.status.UNKNOWN_PROFILE }, function()
         itb.create("no-such-profile")
     end)
-    assert(err.label == "unknown profile name")
+    assert(#err.message > 0, "error object must carry a diagnostic")
 end)
 
 run("unknown opts key maps to BAD_INPUT", function()
@@ -357,6 +361,123 @@ run("hex codec", function()
     assert(itb.fromhex(itb.tohex(payload(257, 9))) == payload(257, 9))
     assert(not pcall(itb.fromhex, "0g"))
     assert(not pcall(itb.fromhex, "012"))
+end)
+
+run("hash registry enumeration", function()
+    local got = itb.hash_names()
+    assert(#got > 0, "empty hash registry")
+    local set = {}
+    for _, name in ipairs(got) do
+        assert(type(name) == "string" and #name > 0)
+        set[name] = true
+    end
+    for _, want in ipairs({ "areion512", "blake3", "aesitb128" }) do
+        assert(set[want], "missing hash primitive " .. want)
+    end
+    -- The enumeration is what a caller validates a name against, so a
+    -- name that is not in it must be one libitb3 rejects.
+    assert(not set["nosuchhash"])
+    assert_status({ itb.status.BAD_HASH, itb.status.BAD_INPUT,
+        itb.status.INTERNAL }, function()
+        itb.create("singlemsg-triple-mac-v1",
+            itb.opts({ inner_hash = "nosuchhash" }))
+    end)
+end)
+
+run("gomaxprocs knob", function()
+    -- n <= 0 queries without changing; a positive n sets and reports
+    -- the previous value, so the pair round-trips.
+    local before = itb.set_gomaxprocs(0)
+    assert(type(before) == "number" and before > 0)
+    local prev = itb.set_gomaxprocs(2)
+    assert(prev == before, "set did not report the previous value")
+    assert(itb.set_gomaxprocs(0) == 2, "set did not take effect")
+    itb.set_gomaxprocs(before)
+    assert(itb.set_gomaxprocs(0) == before, "restore failed")
+end)
+
+run("heap profile", function()
+    local path = os.tmpname()
+    itb.write_heap_profile(path)
+    local f = assert(io.open(path, "rb"))
+    local body = f:read("a")
+    f:close()
+    os.remove(path)
+    assert(#body > 0, "empty heap profile")
+    -- pprof output is a gzip stream.
+    assert(body:byte(1) == 0x1F and body:byte(2) == 0x8B, "not a pprof profile")
+    assert_status({ itb.status.BAD_INPUT }, function()
+        itb.write_heap_profile("/nonexistent-directory-for-itb-tests/heap.prof")
+    end)
+end)
+
+run("pool counters", function()
+    local want = itb.pool_stats_len()
+    assert(type(want) == "number" and want > 0)
+    local first = itb.pool_stats()
+    assert(#first == want, "slot count does not match the length query")
+    -- Slot 0 carries the hash-array tier count, and the vector holds
+    -- five slots per tier plus the eight slots of the two byte pools.
+    local tiers = first[1]
+    assert(tiers > 0 and 1 + 5 * tiers + 8 == want, "slot layout mismatch")
+    -- The counters are monotonic totals since library load, so work
+    -- done between two snapshots can only raise them.
+    local pipe <close> = itb.create("singlemsg-triple-mac-v1")
+    pipe:decrypt_message(pipe:encrypt_message(payload(64 * 1024, 3)))
+    local second = itb.pool_stats()
+    local rose = false
+    for i = 1, want do
+        assert(second[i] >= first[i], "counter went backwards at slot " .. i)
+        if second[i] > first[i] then
+            rose = true
+        end
+    end
+    assert(rose, "no counter moved across a round trip")
+end)
+
+run("drbg round trip through a loaded blob", function()
+    for _, name in ipairs({ "csprng", "aesitb128" }) do
+        local sender <close> = itb.create("singlemsg-triple-mac-v1",
+            itb.opts({ drbg = name }))
+        local receiver <close> = itb.load(sender:save())
+        local wire = sender:encrypt_message("drbg " .. name)
+        assert(receiver:decrypt_message(wire) == "drbg " .. name)
+        local back = receiver:encrypt_message("reverse " .. name)
+        assert(sender:decrypt_message(back) == "reverse " .. name)
+    end
+end)
+
+run("drbg inspect, default and unknown name", function()
+    local pipe <close> = itb.create("singlemsg-triple-mac-v1",
+        itb.opts({ drbg = "csprng" }))
+    local record = itb.inspect(pipe:save())
+    assert(record:find('"drbg":"csprng"', 1, true), record)
+    -- With no drbg set the record carries no drbg key, and no shipped
+    -- profile names one.
+    local plain <close> = itb.create("singlemsg-triple-mac-v1")
+    local default = itb.inspect(plain:save())
+    assert(not default:find('"drbg":', 1, true), default)
+    local looked = itb.lookup("singlemsg-triple-mac-v1")
+    assert(not looked:find('"drbg":', 1, true), looked)
+    local err = assert_status({ itb.status.RECIPE_PRIMITIVE_UNKNOWN }, function()
+        itb.create("singlemsg-triple-mac-v1", itb.opts({ drbg = "nope" }))
+    end)
+    assert(tostring(err):find("nope", 1, true), tostring(err))
+end)
+
+run("drbg survives a register copy", function()
+    local pipe <close> = itb.create("singlemsg-triple-mac-v1",
+        itb.opts({ drbg = "csprng" }))
+    -- The inspection-only fields are dropped; drbg is a recipe field
+    -- and stays in the registered copy.
+    local record = itb.inspect(pipe:save())
+        :gsub('"name":"[^"]*",?', "")
+        :gsub('"nonce_bits":%d+,?', "")
+        :gsub('"barrier_fill":%d+,?', "")
+        :gsub('"container_mode":%d+,?', "")
+    itb.register("lua-binding-test-drbg-copy", record)
+    local looked = itb.lookup("lua-binding-test-drbg-copy")
+    assert(looked:find('"drbg":"csprng"', 1, true), looked)
 end)
 
 -- ---------------------------------------------------------------------
