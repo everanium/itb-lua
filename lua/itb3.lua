@@ -38,6 +38,7 @@ local M = loader()
 -- strings as-is.
 
 local KEY_MAP = {
+    mode = "mode",
     nonce_bits = "nonceBits",
     key_bits = "keyBits",
     with_parallax = "withParallax",

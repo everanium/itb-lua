@@ -53,7 +53,7 @@ end
 run("version", function()
     local v = itb.version()
     assert(type(v) == "string" and #v > 0, "empty version")
-    assert(itb._VERSION == "0.5.5")
+    assert(itb._VERSION == "0.5.6")
 end)
 
 run("drbg auto tier", function()
@@ -294,9 +294,11 @@ run("inspect / lookup / profiles", function()
     local looked = itb.lookup("singlemsg-triple-mac-v1")
     assert(record:find('"nonce_bits":', 1, true), "inspect must carry nonce_bits")
     assert(record:find('"barrier_fill":', 1, true), "inspect must carry barrier_fill")
+    assert(record:find('"container_mode":1', 1, true), "inspect must carry container_mode")
     assert(looked:find('"name":"singlemsg-triple-mac-v1"', 1, true), looked)
     assert(not looked:find('"nonce_bits":', 1, true), "lookup must not carry nonce_bits")
     assert(not looked:find('"barrier_fill":', 1, true), "lookup must not carry barrier_fill")
+    assert(not looked:find('"container_mode":', 1, true), "lookup must not carry container_mode")
     assert_status({ itb.status.BAD_INPUT }, function() itb.inspect("not a blob") end)
     assert_status({ itb.status.UNKNOWN_PROFILE }, function() itb.lookup("no-such-profile") end)
     local names = itb.profiles()
@@ -304,6 +306,12 @@ run("inspect / lookup / profiles", function()
     for i = 2, #names do
         assert(names[i - 1] < names[i], "profiles() is not sorted")
     end
+end)
+
+run("inspect carries container_mode override", function()
+    local pipe <close> = itb.create("singlemsg-triple-mac-v1", itb.opts({ mode = 2 }))
+    local record = itb.inspect(pipe:save())
+    assert(record:find('"container_mode":2', 1, true), record)
 end)
 
 run("max_workers", function()

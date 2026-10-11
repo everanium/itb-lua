@@ -579,28 +579,6 @@ local function log_pipeline_initialised(profile, blob)
     state.log_line(line)
 end
 
--- Returns a copy of a wrap-layer session blob whose inner blob's "mode"
--- field is set to target_mode (1 = per-region, 2 = per-container), or
--- nil when the inner blob or its mode field is not found. The wrap
--- layer's profile record carries its own "mode" (a string), so the
--- search starts at the inner blob ("ib"); both shipped modes are one
--- digit wide, so the blob length does not change and nothing before the
--- inner blob is touched.
-local function edit_inner_blob_mode(blob, target_mode)
-    local _, ib_end = blob:find('"ib":{', 1, true)
-    if ib_end == nil then
-        return nil
-    end
-    local _, mode_end = blob:find('"mode":', ib_end + 1, true)
-    if mode_end == nil then
-        return nil
-    end
-    local at = mode_end + 1
-    if not blob:sub(at, at):match("^[12]$") or blob:sub(at + 1, at + 1):match("^%d$") then
-        return nil
-    end
-    return blob:sub(1, at - 1) .. string.format("%d", target_mode) .. blob:sub(at + 1)
-end
 
 -- Folds a keystream primitive into opts for any layer the named profile
 -- leaves unfilled but the operator asked for.
@@ -653,6 +631,7 @@ end
 -- use the retained blob; save is never called again.
 local function build_pipeline(cfg, profile)
     local opts = {
+        mode = cfg.blob_mode,
         inner_hash = cfg.hash,
         mac_name = cfg.mac,
         with_parallax = cfg.parallax,
@@ -685,24 +664,6 @@ local function build_pipeline(cfg, profile)
         err(string.format("Save(%s): %s", profile, state.status_detail(blob)))
         pipe:free()
         return nil
-    end
-    if cfg.blob_mode == 2 then
-        -- The sizing mode is not an Opts knob: the Init blob is edited
-        -- and the pipeline reopened from it, so the retained blob (the
-        -- one blob-cycle reopens from) carries the edited mode.
-        local edited = edit_inner_blob_mode(blob, 2)
-        if edited == nil then
-            err("rewrite blob mode: inner blob mode field not found")
-            pipe:free()
-            return nil
-        end
-        pipe:free()
-        local loaded, fresh = pcall(itb.load, edited)
-        if not loaded then
-            err("reload Mode 2 blob: " .. state.status_detail(fresh))
-            return nil
-        end
-        pipe, blob = fresh, edited
     end
     log_pipeline_initialised(profile, blob)
     return pipe, blob
