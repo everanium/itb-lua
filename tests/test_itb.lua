@@ -53,7 +53,7 @@ end
 run("version", function()
     local v = itb.version()
     assert(type(v) == "string" and #v > 0, "empty version")
-    assert(itb._VERSION == "0.6.1")
+    assert(itb._VERSION == "0.7.1")
 end)
 
 run("drbg auto tier", function()
