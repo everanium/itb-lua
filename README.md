@@ -12,7 +12,7 @@ API; no LuaJIT, no FFI library). The compiled `libitb3_lua.so` module links
 `libitb3.so` directly, and every hash-name / MAC-name / cipher-name /
 profile-name is an opaque string passed through to Go for validation —
 the binding carries no ITB construction logic. The public surface is a
-`Pipeline` userdata (create / load / load_f / save / save_f / rekey /
+`Pipeline` userdata (create / create_keys / load / load_f / save / save_f / rekey /
 max_workers / close, Single Message encrypt / decrypt, one-shot
 and incremental stream sessions), an opts query-string builder for
 `create`, the profile-catalogue functions (`inspect` / `register` /
@@ -101,6 +101,8 @@ local opts = itb.opts({ mode = 2, chunk_size = 65536, with_wrapper = false })
 local sender = itb.create("singlemsg-triple-mac-v1", opts)
 local receiver = itb.load(sender:save())
 ```
+
+`itb.create_keys(profile, masters [, opts])` constructs a session from caller-supplied master keys (`8` keys when neither Parallax nor the Wrapper is active, `9` when one is, `10` when both are, each 16–64 bytes and pairwise distinct) instead of drawing from the library CSPRNG.
 
 `pipe:rekey(perm, wrap)` rotates the parallax + wrapper masters
 mid-session (the eight ITB seeds and MAC key are fixed for the

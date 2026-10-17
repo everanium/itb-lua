@@ -11,6 +11,7 @@
  * Surface registered on the module table:
  *
  *   itb.create(profile [, opts])            -> Pipeline
+ *   itb.create_keys(profile, masters [, opts]) -> Pipeline
  *   itb.load(blob [, perm, wrap])           -> Pipeline
  *   itb.load_f(path [, perm, wrap])         -> Pipeline
  *   itb.inspect(blob)                       -> profile-record JSON string
@@ -66,7 +67,7 @@
 
 #include "libitb3.h"
 
-#define ITB_LUA_VERSION "0.7.2"
+#define ITB_LUA_VERSION "0.7.3"
 
 #define PIPE_MT "itb.pipeline"
 #define STREAM_MT "itb.stream"
@@ -319,6 +320,77 @@ static int l_create(lua_State *L) {
     c.opts = luaL_optstring(L, 2, "");
     c.handle = 0;
     buf_call(L, init_thunk, &c, BLOB_CAP);
+    lua_pop(L, 1); /* the Init-time blob copy; save() re-reads it */
+    push_pipe(L, c.handle);
+    return 1;
+}
+
+typedef struct {
+    const char *profile;
+    const char *opts;
+    uint8_t *flat;
+    size_t total_len;
+    size_t *lens;
+    size_t count;
+    uintptr_t handle;
+    int attempt;
+} init_keys_ctx;
+
+static int init_keys_thunk(void *ctx, void *out, size_t cap, size_t *n) {
+    init_keys_ctx *c = (init_keys_ctx *)ctx;
+    int rc = ITB_Triple_InitKeys(MUT(c->profile), MUT(c->opts), c->flat,
+                                 c->total_len, c->lens, c->count, out, cap, n,
+                                 &c->handle);
+    if (c->flat != NULL &&
+        !(rc == ST_BUFFER_TOO_SMALL && *n > cap && c->attempt == 0)) {
+        memset(c->flat, 0, c->total_len);
+    }
+    c->attempt++;
+    return rc;
+}
+
+/* itb.create_keys(profile, masters [, opts]) -> Pipeline. Constructs a
+ * session from caller-supplied master keys (ITB_Triple_InitKeys). */
+static int l_create_keys(lua_State *L) {
+    init_keys_ctx c;
+    size_t i, off;
+    c.profile = luaL_checkstring(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    c.opts = luaL_optstring(L, 3, "");
+    c.count = (size_t)luaL_len(L, 2);
+    c.total_len = 0;
+    c.flat = NULL;
+    c.lens = NULL;
+    c.handle = 0;
+    c.attempt = 0;
+
+    if (c.count > 0) {
+        c.lens = (size_t *)lua_newuserdatauv(L, c.count * sizeof(size_t), 0);
+        for (i = 0; i < c.count; i++) {
+            size_t klen = 0;
+            lua_rawgeti(L, 2, (lua_Integer)(i + 1));
+            luaL_checklstring(L, -1, &klen);
+            c.lens[i] = klen;
+            c.total_len += klen;
+            lua_pop(L, 1);
+        }
+    }
+    if (c.total_len > 0) {
+        c.flat = (uint8_t *)lua_newuserdatauv(L, c.total_len, 0);
+        off = 0;
+        for (i = 0; i < c.count; i++) {
+            size_t klen = 0;
+            const char *k = NULL;
+            lua_rawgeti(L, 2, (lua_Integer)(i + 1));
+            k = luaL_checklstring(L, -1, &klen);
+            if (klen > 0) {
+                memcpy(c.flat + off, k, klen);
+                off += klen;
+            }
+            lua_pop(L, 1);
+        }
+    }
+    buf_call(L, init_keys_thunk, &c, BLOB_CAP);
     lua_pop(L, 1); /* the Init-time blob copy; save() re-reads it */
     push_pipe(L, c.handle);
     return 1;
@@ -902,6 +974,8 @@ static const luaL_Reg STREAM_METHODS[] = {
 
 static const luaL_Reg MODULE_FUNCS[] = {
     {"create", l_create},
+    {"create_keys", l_create_keys},
+    {"init_keys", l_create_keys},
     {"load", l_load},
     {"load_f", l_load_f},
     {"inspect", l_inspect},

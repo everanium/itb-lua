@@ -53,7 +53,7 @@ end
 run("version", function()
     local v = itb.version()
     assert(type(v) == "string" and #v > 0, "empty version")
-    assert(itb._VERSION == "0.7.2")
+    assert(itb._VERSION == "0.7.3")
 end)
 
 run("drbg auto tier", function()
@@ -281,6 +281,33 @@ run("load with master override", function()
     assert(receiver:save() == rotated)
     local wire = sender:encrypt_message("master override")
     assert(receiver:decrypt_message(wire) == "master override")
+end)
+
+run("create_keys determinism and BAD_INPUT error propagation", function()
+    local opts = itb.opts({ with_parallax = false, with_wrapper = false })
+    local masters = {}
+    for i = 1, 8 do
+        masters[i] = string.rep(string.char(0x11 * i), 32)
+    end
+    local p1 <close> = itb.create_keys("singlemsg-triple-mac-v1", masters, opts)
+    local p2 <close> = itb.create_keys("singlemsg-triple-mac-v1", masters, opts)
+    assert(p1:save() == p2:save(), "create_keys blobs differ")
+    local wire = p1:encrypt_message("deterministic keys")
+    assert(p2:decrypt_message(wire) == "deterministic keys")
+
+    local dup = {}
+    for i = 1, 8 do dup[i] = masters[i] end
+    dup[8] = dup[1]
+    assert_status({ itb.status.BAD_INPUT }, function()
+        itb.create_keys("singlemsg-triple-mac-v1", dup, opts)
+    end)
+
+    local short = {}
+    for i = 1, 8 do short[i] = masters[i] end
+    short[1] = string.rep("\xAA", 8)
+    assert_status({ itb.status.BAD_INPUT }, function()
+        itb.create_keys("singlemsg-triple-mac-v1", short, opts)
+    end)
 end)
 
 run("inspect / lookup / profiles", function()

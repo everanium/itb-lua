@@ -99,6 +99,15 @@ function M.opts(tbl)
     return table.concat(pairs_out, "&")
 end
 
+local raw_create_keys = M.create_keys
+function M.create_keys(profile, masters, opts)
+    if type(opts) == "table" then
+        opts = M.opts(opts)
+    end
+    return raw_create_keys(profile, masters, opts)
+end
+M.init_keys = M.create_keys
+
 -- ---------------------------------------------------------------------
 -- Hex codec (blob transport through shells / config files).
 
