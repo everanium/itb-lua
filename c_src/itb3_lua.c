@@ -67,7 +67,7 @@
 
 #include "libitb3.h"
 
-#define ITB_LUA_VERSION "0.7.4"
+#define ITB_LUA_VERSION "0.7.5"
 
 #define PIPE_MT "itb.pipeline"
 #define STREAM_MT "itb.stream"
@@ -263,9 +263,24 @@ static int cipher_call(lua_State *L, cipher_fn fn, uintptr_t handle,
  * the produced or required length through n. */
 typedef int (*buf_fn)(void *ctx, void *out, size_t cap, size_t *n);
 
-/* Runs a caller-allocated-buffer entry with the retry-once discipline
- * and leaves the produced bytes on the stack as a string. */
-static int buf_call(lua_State *L, buf_fn fn, void *ctx, size_t cap) {
+/* Zeroes a buffer through a volatile byte pointer so the compiler
+ * cannot dead-store-eliminate the wipe before release. */
+static void wipe_bytes(void *ptr, size_t len) {
+    if (ptr == NULL || len == 0) {
+        return;
+    }
+    volatile uint8_t *vp = (volatile uint8_t *)ptr;
+    while (len--) {
+        *vp++ = 0;
+    }
+}
+
+/* Runs a caller-allocated-buffer entry with the retry-once discipline.
+ * When keep_result is non-zero, leaves the produced bytes on the stack
+ * as a Lua string; when zero, wipes the staging buffer in place and
+ * discards it without interning a Lua string. */
+static int buf_call_mode(lua_State *L, buf_fn fn, void *ctx, size_t cap,
+                         int keep_result) {
     int attempt;
     for (attempt = 0; attempt < 2; attempt++) {
         luaL_Buffer b;
@@ -273,20 +288,35 @@ static int buf_call(lua_State *L, buf_fn fn, void *ctx, size_t cap) {
         size_t n = 0;
         int rc = fn(ctx, p, cap, &n);
         if (rc == ST_BUFFER_TOO_SMALL && n > cap && attempt == 0) {
+            wipe_bytes(p, cap);
             luaL_pushresultsize(&b, 0);
             lua_pop(L, 1); /* discard the undersized buffer */
             cap = n;
             continue;
         }
         if (rc != ST_OK) {
+            wipe_bytes(p, cap);
             luaL_pushresultsize(&b, 0);
             lua_pop(L, 1);
             return raise_status(L, rc);
+        }
+        if (!keep_result) {
+            wipe_bytes(p, cap);
+            luaL_pushresultsize(&b, 0);
+            lua_pop(L, 1);
+            return 0;
+        }
+        if (n < cap) {
+            wipe_bytes(p + n, cap - n);
         }
         luaL_pushresultsize(&b, n);
         return 1;
     }
     return raise_status(L, ST_BUFFER_TOO_SMALL);
+}
+
+static int buf_call(lua_State *L, buf_fn fn, void *ctx, size_t cap) {
+    return buf_call_mode(L, fn, ctx, cap, 1);
 }
 
 /* ---- module functions ---------------------------------------------- */
@@ -319,8 +349,7 @@ static int l_create(lua_State *L) {
     c.profile = luaL_checkstring(L, 1);
     c.opts = luaL_optstring(L, 2, "");
     c.handle = 0;
-    buf_call(L, init_thunk, &c, BLOB_CAP);
-    lua_pop(L, 1); /* the Init-time blob copy; save() re-reads it */
+    buf_call_mode(L, init_thunk, &c, BLOB_CAP, 0);
     push_pipe(L, c.handle);
     return 1;
 }
@@ -343,7 +372,7 @@ static int init_keys_thunk(void *ctx, void *out, size_t cap, size_t *n) {
                                  &c->handle);
     if (c->flat != NULL &&
         !(rc == ST_BUFFER_TOO_SMALL && *n > cap && c->attempt == 0)) {
-        memset(c->flat, 0, c->total_len);
+        wipe_bytes(c->flat, c->total_len);
     }
     c->attempt++;
     return rc;
@@ -390,8 +419,7 @@ static int l_create_keys(lua_State *L) {
             lua_pop(L, 1);
         }
     }
-    buf_call(L, init_keys_thunk, &c, BLOB_CAP);
-    lua_pop(L, 1); /* the Init-time blob copy; save() re-reads it */
+    buf_call_mode(L, init_keys_thunk, &c, BLOB_CAP, 0);
     push_pipe(L, c.handle);
     return 1;
 }
