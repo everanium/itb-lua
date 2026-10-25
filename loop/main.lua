@@ -97,6 +97,8 @@ local FLAGS = {
         "concurrent workers (1..10); on runtimes without parallelism values above 1 are clamped to 1" },
     { "hash", "string", STRING, "areion512",
         "inner ITB hash primitive name" },
+    { "interlock", "string", STRING, "",
+        "Interlocked Barrier chunk width: 48 | 168; empty = profile default (48; 168 requires 512-bit hash)" },
     { "iterations", "int", INT64, 0,
         "fixed per-worker iteration count; 0 = duration-based" },
     { "json-output", "", BOOL, false,
@@ -506,6 +508,13 @@ local function parse_flags(argv)
     end
     -- Validated by Init: the C ABI enumerates no DRBG names.
     cfg.drbg = raw["drbg"]
+    cfg.interlock = raw["interlock"]
+    if cfg.interlock ~= "" and cfg.interlock ~= "48" and cfg.interlock ~= "168" then
+        err(string.format(
+            '--interlock must be 48 | 168 (or empty = profile default), got "%s"',
+            cfg.interlock))
+        return -1, cfg
+    end
     local chunk_size = size.parse_size(raw["chunk-size"])
     if chunk_size == nil then
         err(string.format('--chunk-size: invalid size "%s"', raw["chunk-size"]))
@@ -576,6 +585,10 @@ local function log_pipeline_initialised(profile, blob)
     if drbg ~= "-" then
         line = line .. " drbg=" .. drbg
     end
+    local interlock = record_str(json, "interlock")
+    if interlock ~= "-" then
+        line = line .. " interlock=" .. interlock
+    end
     state.log_line(line)
 end
 
@@ -640,6 +653,7 @@ local function build_pipeline(cfg, profile)
         nonce_bits = cfg.nonce_bits,
         barrier_fill = cfg.barrier_fill,
         drbg = cfg.drbg,
+        interlock = cfg.interlock,
         chunk_size = cfg.chunk_size,
     }
     if cfg.profile ~= "" then
@@ -723,14 +737,15 @@ local function run(argv)
     state.log_line(string.format(
         'overrides: profile="%s" key-bits=%d nonce-bits=%d chunk-size=%s '
         .. "barrier-fill=%d gomaxprocs=%d rekey-every=%d blob-cycle-every=%d "
-        .. "payload-mode=%s seed=%s json-output=%s%s%s",
+        .. "payload-mode=%s seed=%s json-output=%s%s%s%s",
         cfg.profile, cfg.key_bits, cfg.nonce_bits,
         size.human_bytes(cfg.chunk_size), cfg.barrier_fill, cfg.gomaxprocs,
         cfg.rekey_every, cfg.blob_cycle_every,
         payload.mode_name(cfg.payload_mode), u64_dec(cfg.seed),
         cfg.json_output and "true" or "false",
         cfg.blob_mode ~= 1 and string.format(" blob-mode=%d", cfg.blob_mode) or "",
-        cfg.drbg ~= "" and " drbg=" .. cfg.drbg or ""))
+        cfg.drbg ~= "" and " drbg=" .. cfg.drbg or "",
+        cfg.interlock ~= "" and " interlock=" .. cfg.interlock or ""))
     state.log_line(string.format(
         "policy: microbatch-tiers=%s hashpool-starters=%s",
         state.policy_label(os.getenv("ITB_MICROBATCH_TIERS")),

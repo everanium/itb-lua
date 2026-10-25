@@ -92,12 +92,13 @@ receiver:free()
 
 `itb.opts` overrides the profile default at `create` (chunk size,
 outer cipher, parallax on/off, wrapper on/off, MAC name, palette,
+`interlock` (`"48"` | `"168"`, `""` = default 48-bit; `"168"` requires a 512-bit hash),
 worker cap); the table is rendered into the URL-query string libitb3
 consumes. The resolved shape is written into the blob, so the
 receiver loads it with no opts of its own:
 
 ```lua
-local opts = itb.opts({ mode = 2, chunk_size = 65536, with_wrapper = false })
+local opts = itb.opts({ mode = 2, interlock = "168", chunk_size = 65536, with_wrapper = false })
 local sender = itb.create("singlemsg-triple-mac-v1", opts)
 local receiver = itb.load(sender:save())
 ```
@@ -154,7 +155,7 @@ keys map onto the Go opts grammar; unknown keys pass through
 verbatim):
 
 ```lua
-local opts = itb.opts({ mode = 2, nonce_bits = 512, key_bits = 1024, chunk_size = 65536 })
+local opts = itb.opts({ mode = 2, interlock = "168", nonce_bits = 512, key_bits = 1024, chunk_size = 65536 })
 local pipe = itb.create("streaming-aead-triple-mac-v1", opts)
 ```
 

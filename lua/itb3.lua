@@ -39,6 +39,7 @@ local M = loader()
 
 local KEY_MAP = {
     mode = "mode",
+    interlock = "interlock",
     nonce_bits = "nonceBits",
     key_bits = "keyBits",
     with_parallax = "withParallax",
