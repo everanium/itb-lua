@@ -82,7 +82,7 @@ local FLAGS = {
     { "blob-cycle-every", "int", INT64, 0,
         "reopen each pipeline from its session blob every N iterations per worker; 0 = never" },
     { "blob-mode", "int", INT, 1,
-        "container floor sizing mode: 1 (per-region, default) | 2 (per-container)" },
+        "container floor sizing mode: 1 (per-region, default) | 2 (per-container) | 3 (gauss-posit)" },
     { "chunk-size", "string", STRING, "0",
         "streaming chunk-size budget (e.g. 4MB); 0 = profile default; inert for pure message shape" },
     { "drbg", "string", STRING, "",
@@ -491,9 +491,9 @@ local function parse_flags(argv)
         return -1, cfg
     end
     cfg.blob_mode = raw["blob-mode"]
-    if cfg.blob_mode ~= 1 and cfg.blob_mode ~= 2 then
+    if cfg.blob_mode ~= 1 and cfg.blob_mode ~= 2 and cfg.blob_mode ~= 3 then
         err(string.format(
-            "--blob-mode must be 1 (per-region) | 2 (per-container), got %d",
+            "--blob-mode must be 1 (per-region) | 2 (per-container) | 3 (gauss-posit), got %d",
             cfg.blob_mode))
         return -1, cfg
     end
@@ -578,7 +578,7 @@ local function log_pipeline_initialised(profile, blob)
         state.on_off(record_bool(json, "parallax")),
         state.on_off(record_bool(json, "wrapper")))
     local container_mode = record_int(json, "container_mode")
-    if container_mode == 2 then
+    if container_mode == 2 or container_mode == 3 then
         line = line .. string.format(" container-mode=%d", container_mode)
     end
     local drbg = record_str(json, "drbg")

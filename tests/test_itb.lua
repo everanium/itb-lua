@@ -53,7 +53,7 @@ end
 run("version", function()
     local v = itb.version()
     assert(type(v) == "string" and #v > 0, "empty version")
-    assert(itb._VERSION == "0.9.0")
+    assert(itb._VERSION == "0.9.1")
 end)
 
 run("drbg auto tier", function()
@@ -339,6 +339,9 @@ run("inspect carries container_mode override", function()
     local pipe <close> = itb.create("singlemsg-triple-mac-v1", itb.opts({ mode = 2 }))
     local record = itb.inspect(pipe:save())
     assert(record:find('"container_mode":2', 1, true), record)
+    local pipe3 <close> = itb.create("singlemsg-triple-mac-v1", itb.opts({ mode = 3 }))
+    local record3 = itb.inspect(pipe3:save())
+    assert(record3:find('"container_mode":3', 1, true), record3)
 end)
 
 run("max_workers", function()
